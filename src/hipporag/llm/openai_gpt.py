@@ -132,7 +132,7 @@ class CacheOpenAI(BaseLLM):
 
         os.makedirs(self.cache_dir, exist_ok=True)
         if cache_filename is None:
-            cache_filename = f"{self.llm_name.replace('/', '_')}_cache.sqlite"
+            cache_filename = f"{self.llm_name.replace('/', '_').replace(':', '_')}_cache.sqlite"
         self.cache_file_name = os.path.join(self.cache_dir, cache_filename)
 
         self._init_llm_config()

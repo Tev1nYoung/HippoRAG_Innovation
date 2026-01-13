@@ -55,7 +55,7 @@ class VLLMOffline:
         
         self.tokenizer = self.client.get_tokenizer()
         if cache_filename is None:
-            cache_filename = f'{model_name.replace("/", "_")}_cache.sqlite'
+            cache_filename = f'{model_name.replace("/", "_").replace(":", "_")}_cache.sqlite'
         if cache_dir is None:
             cache_dir = os.path.join(global_config.save_dir, "llm_cache")
         self.cache_file_name = os.path.join(cache_dir, cache_filename)

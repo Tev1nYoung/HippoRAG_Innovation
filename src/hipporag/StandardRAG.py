@@ -6,14 +6,14 @@ from datetime import datetime
 from typing import Union, Optional, List, Set, Dict, Any, Tuple, Literal
 import numpy as np
 import importlib
-from collections import defaultdict
+from collections import defaultdict, Counter
 from transformers import HfArgumentParser
 from concurrent.futures import ThreadPoolExecutor
 from tqdm import tqdm
 from igraph import Graph
 import igraph as ig
 import numpy as np
-from collections import defaultdict
+from collections import defaultdict, Counter
 import re
 import time
 
@@ -74,8 +74,8 @@ class StandardRAG:
         logger.debug(f"HippoRAG init with config:\n  {_print_config}\n")
 
         #LLM and embedding model specific working directories are created under every specified saving directories
-        llm_label = self.global_config.llm_name.replace("/", "_")
-        embedding_label = self.global_config.embedding_model_name.replace("/", "_")
+        llm_label = self.global_config.llm_name.replace("/", "_").replace(":", "_")
+        embedding_label = self.global_config.embedding_model_name.replace("/", "_").replace(":", "_")
         self.working_dir = os.path.join(self.global_config.save_dir, f"{llm_label}_{embedding_label}")
 
         if not os.path.exists(self.working_dir):
@@ -91,18 +91,20 @@ class StandardRAG:
                 embedding_model_name=self.global_config.embedding_model_name)(global_config=self.global_config,
                                                                               embedding_model_name=self.global_config.embedding_model_name)
 
-        import ipdb;
-        ipdb.set_trace()
-
         self.chunk_embedding_store = EmbeddingStore(self.embedding_model,
                                                     os.path.join(self.working_dir, "chunk_embeddings"),
                                                     self.global_config.embedding_batch_size, 'chunk')
+
+        self.prompt_template_manager = PromptTemplateManager(
+            role_mapping={"system": "system", "user": "user", "assistant": "assistant"}
+        )
 
         self.ready_to_retrieve = False
 
         self.ppr_time = 0
         self.rerank_time = 0
         self.all_retrieval_time = 0
+        self.last_retrieval_mode_counts: Dict[str, int] = {}
 
     def index(self, docs: List[str]):
         """
@@ -182,10 +184,12 @@ class StandardRAG:
         self.get_query_embeddings(queries)
 
         retrieval_results = []
+        mode_counts = Counter()
 
         for q_idx, query in tqdm(enumerate(queries), desc="Retrieving", total=len(queries)):
-            logger.info('No facts found after reranking, return DPR results')
             sorted_doc_ids, sorted_doc_scores = self.dense_passage_retrieval(query)
+            logger.info(f"[Retrieval][DPR] Query #{q_idx}: dense retrieval (StandardRAG).")
+            mode_counts['dpr'] += 1
 
             top_k_docs = [self.chunk_embedding_store.get_row(self.passage_node_keys[idx])["content"] for idx in
                           sorted_doc_ids[:num_to_retrieve]]
@@ -194,6 +198,7 @@ class StandardRAG:
                 QuerySolution(question=query, docs=top_k_docs, doc_scores=sorted_doc_scores[:num_to_retrieve]))
 
         retrieve_end_time = time.time()  # Record end time
+        self.last_retrieval_mode_counts = dict(mode_counts)
 
         self.all_retrieval_time += retrieve_end_time - retrieve_start_time
 
@@ -205,11 +210,75 @@ class StandardRAG:
             overall_retrieval_result, example_retrieval_results = retrieval_recall_evaluator.calculate_metric_scores(
                 gold_docs=gold_docs, retrieved_docs=[retrieval_result.docs for retrieval_result in retrieval_results],
                 k_list=k_list)
+            overall_retrieval_result["retrieval_mode_counts"] = dict(mode_counts)
             logger.info(f"Evaluation results for retrieval: {overall_retrieval_result}")
+
+            # Save retrieval metrics to file
+            self._save_evaluation_metrics(overall_retrieval_result, None, source="StandardRAG.retrieve")
 
             return retrieval_results, overall_retrieval_result
         else:
             return retrieval_results
+
+    def _save_evaluation_metrics(self,
+                                 retrieval_metrics: Optional[Dict] = None,
+                                 qa_metrics: Optional[Dict] = None,
+                                 source: Optional[str] = None):
+        """
+        Save evaluation metrics to file by appending a new run entry with a timestamp.
+        This preserves previous runs rather than overwriting them.
+
+        Args:
+            retrieval_metrics: Dictionary containing retrieval evaluation metrics (e.g., Recall@k)
+            qa_metrics: Dictionary containing QA evaluation metrics (e.g., ExactMatch, F1)
+        """
+        metrics_file_path = os.path.join(self.working_dir, "evaluation_metrics.json")
+
+        if retrieval_metrics is None and qa_metrics is None:
+            return
+
+        # Load existing metrics if file exists
+        existing_payload = {}
+        runs = []
+        if os.path.exists(metrics_file_path):
+            try:
+                with open(metrics_file_path, 'r') as f:
+                    existing_data = json.load(f)
+            except (json.JSONDecodeError, IOError) as e:
+                logger.warning(f"Failed to load existing metrics file: {e}. Starting with empty metrics.")
+                existing_data = None
+
+            if isinstance(existing_data, dict):
+                if isinstance(existing_data.get("runs"), list):
+                    runs = existing_data.get("runs", [])
+                    existing_payload = {k: v for k, v in existing_data.items() if k != "runs"}
+                else:
+                    existing_payload = {"legacy_metrics": existing_data}
+            elif isinstance(existing_data, list):
+                runs = existing_data
+
+        timestamp = datetime.now().astimezone().replace(microsecond=0).isoformat()
+        run_entry = {
+            "timestamp": timestamp,
+            "llm_name": getattr(self.global_config, "llm_name", None),
+            "embedding_model_name": getattr(self.global_config, "embedding_model_name", None),
+            "dataset": getattr(self.global_config, "dataset", None),
+            "source": source or self.__class__.__name__,
+        }
+        if retrieval_metrics is not None and getattr(self, "last_retrieval_mode_counts", None):
+            run_entry["retrieval_mode_counts"] = self.last_retrieval_mode_counts
+        if retrieval_metrics is not None:
+            run_entry["retrieval_metrics"] = retrieval_metrics
+        if qa_metrics is not None:
+            run_entry["qa_metrics"] = qa_metrics
+
+        runs.append(run_entry)
+        evaluation_payload = dict(existing_payload)
+        evaluation_payload["runs"] = runs
+
+        with open(metrics_file_path, 'w') as f:
+            json.dump(evaluation_payload, f, indent=2)
+        logger.info(f"Evaluation metrics saved to {metrics_file_path}")
 
     def rag_qa(self,
                queries: List[str|QuerySolution],
@@ -280,6 +349,9 @@ class StandardRAG:
                 q.gold_answers = list(gold_answers[idx])
                 if gold_docs is not None:
                     q.gold_docs = gold_docs[idx]
+
+            # Save/update evaluation metrics to file (QA metrics will be merged with existing retrieval metrics if any)
+            self._save_evaluation_metrics(None, overall_qa_results, source="StandardRAG.rag_qa")
 
             return queries_solutions, all_response_message, all_metadata, overall_retrieval_result, overall_qa_results
         else:

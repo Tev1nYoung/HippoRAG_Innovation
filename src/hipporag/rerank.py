@@ -7,6 +7,7 @@ from typing import Union, Optional, List, Dict, Any, Tuple, Literal
 import re
 import ast
 from .prompts.filter_default_prompt import best_dspy_prompt
+from .utils.llm_utils import fix_broken_generated_json
 
 class Fact(BaseModel):
     fact: list[list[str]] = Field(description="A list of facts, each fact is a list of 3 strings: [subject, predicate, object]")
@@ -68,15 +69,33 @@ class DSPyFilter:
         for k, value in sections:
             if k == "fact_after_filter":
                 try:
-                    # fields[k] = parse_value(v, signature.output_fields[k].annotation) if _parse_values else v
+                    # Robust pre-processing: fix common JSON issues like extra braces
+                    cleaned_value = fix_broken_generated_json(value)
+
                     try:
-                        parsed_value = json.loads(value)
+                        parsed_value = json.loads(cleaned_value)
                     except json.JSONDecodeError:
                         try:
-                            parsed_value = ast.literal_eval(value)
+                            parsed_value = ast.literal_eval(cleaned_value)
                         except (ValueError, SyntaxError):
-                            parsed_value = value
-                    parsed = TypeAdapter(Fact).validate_python(parsed_value).fact
+                            # Fallback: extracted facts using regex if structural parsing fails
+                            # Looks for [ ["s", "p", "o"], ... ]
+                            triple_pattern = r'\[\s*"([^"]*)"\s*,\s*"([^"]*)"\s*,\s*"([^"]*)"\s*\]'
+                            triples = re.findall(triple_pattern, cleaned_value)
+                            if triples:
+                                parsed_value = {"fact": [list(t) for t in triples]}
+                            else:
+                                parsed_value = value
+
+                    # Ensure we have a dict before passing to Pydantic to avoid "Input should be a valid dictionary" error
+                    if isinstance(parsed_value, dict) and "fact" in parsed_value:
+                        parsed = TypeAdapter(Fact).validate_python(parsed_value).fact
+                    elif isinstance(parsed_value, list):
+                        # If the LLM returned just the list of facts
+                        parsed = TypeAdapter(Fact).validate_python({"fact": parsed_value}).fact
+                    else:
+                        raise ValueError(f"Value could not be parsed into a Fact structure: {parsed_value}")
+
                 except Exception as e:
                     print(
                         f"Error parsing field {k}: {e}.\n\n\t\tOn attempting to parse the value\n```\n{value}\n```"
@@ -122,7 +141,7 @@ class DSPyFilter:
         for generated_fact in generated_facts:
             closest_matched_fact = difflib.get_close_matches(str(generated_fact), [str(i) for i in candidate_items], n=1, cutoff=0.0)[0]
             try:
-                result_indices.append(candidate_items.index(eval(closest_matched_fact)))
+                result_indices.append(candidate_items.index(ast.literal_eval(closest_matched_fact)))
             except Exception as e:
                 print('result_indices exception', e)
 
