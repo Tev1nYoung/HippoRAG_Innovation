@@ -33,7 +33,7 @@ class EmbeddingStore:
         self.namespace = namespace
 
         if not os.path.exists(db_filename):
-            logger.info(f"Creating working directory: {db_filename}")
+            logger.info(f"创建工作目录: {db_filename}")
             os.makedirs(db_filename, exist_ok=True)
 
         self.filename = os.path.join(
@@ -77,7 +77,7 @@ class EmbeddingStore:
         missing_ids = [hash_id for hash_id in all_hash_ids if hash_id not in existing]
 
         logger.info(
-            f"Inserting {len(missing_ids)} new records, {len(all_hash_ids) - len(missing_ids)} records already exist.")
+            f"插入 {len(missing_ids)} 条新记录，{len(all_hash_ids) - len(missing_ids)} 条记录已存在")
 
         if not missing_ids:
             return  {}# All records already exist.
@@ -85,9 +85,17 @@ class EmbeddingStore:
         # Prepare the texts to encode from the "content" field.
         texts_to_encode = [nodes_dict[hash_id]["content"] for hash_id in missing_ids]
 
-        missing_embeddings = self.embedding_model.batch_encode(texts_to_encode)
+        # 分批编码和保存，每1000条保存一次，支持断点续传
+        chunk_size = 1000
+        for i in range(0, len(texts_to_encode), chunk_size):
+            chunk_texts = texts_to_encode[i:i + chunk_size]
+            chunk_ids = missing_ids[i:i + chunk_size]
 
-        self._upsert(missing_ids, texts_to_encode, missing_embeddings)
+            logger.info(f"编码批次 {i//chunk_size + 1}/{(len(texts_to_encode) + chunk_size - 1)//chunk_size} ({len(chunk_texts)} 条记录)")
+            chunk_embeddings = self.embedding_model.batch_encode(chunk_texts)
+
+            # 立即保存这一批
+            self._upsert(chunk_ids, chunk_texts, chunk_embeddings)
 
     def _load_data(self):
         if os.path.exists(self.filename):
@@ -101,7 +109,7 @@ class EmbeddingStore:
             self.hash_id_to_text = {h: self.texts[idx] for idx, h in enumerate(self.hash_ids)}
             self.text_to_hash_id = {self.texts[idx]: h  for idx, h in enumerate(self.hash_ids)}
             assert len(self.hash_ids) == len(self.texts) == len(self.embeddings)
-            logger.info(f"Loaded {len(self.hash_ids)} records from {self.filename}")
+            logger.info(f"从文件加载了 {len(self.hash_ids)} 条记录: {self.filename}")
         else:
             self.hash_ids, self.texts, self.embeddings = [], [], []
             self.hash_id_to_idx, self.hash_id_to_row = {}, {}
@@ -117,14 +125,14 @@ class EmbeddingStore:
         self.hash_id_to_idx = {h: idx for idx, h in enumerate(self.hash_ids)}
         self.hash_id_to_text = {h: self.texts[idx] for idx, h in enumerate(self.hash_ids)}
         self.text_to_hash_id = {self.texts[idx]: h for idx, h in enumerate(self.hash_ids)}
-        logger.info(f"Saved {len(self.hash_ids)} records to {self.filename}")
+        logger.info(f"已保存 {len(self.hash_ids)} 条记录到 {self.filename}")
 
     def _upsert(self, hash_ids, texts, embeddings):
         self.embeddings.extend(embeddings)
         self.hash_ids.extend(hash_ids)
         self.texts.extend(texts)
 
-        logger.info(f"Saving new records.")
+        logger.info(f"保存新记录")
         self._save_data()
 
     def delete(self, hash_ids):

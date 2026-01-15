@@ -141,9 +141,17 @@ class BaseConfig:
         default="auto",
         metadata={"help": "Data type for local embedding model."}
     )
-    
-    
-    
+    use_quantization: bool = field(
+        default=False,
+        metadata={"help": "Whether to use quantization for embedding model (requires bitsandbytes)."}
+    )
+    quantization_bits: Literal[4, 8] = field(
+        default=4,
+        metadata={"help": "Quantization bits: 4 (NF4, ~5.5GB) or 8 (INT8, ~7.8GB)."}
+    )
+
+
+
     # Graph construction specific attributes
     synonymy_edge_topk: int = field(
         default=2047,
@@ -191,6 +199,18 @@ class BaseConfig:
     qa_top_k: int = field(
         default=5,
         metadata={"help": "Feeding top k documents to the QA model for reading."}
+    )
+    qa_num_workers: int = field(
+        default=1,
+        metadata={"help": "Number of concurrent QA requests to run."}
+    )
+    retrieval_num_workers: int = field(
+        default=1,
+        metadata={"help": "Number of concurrent retrieval requests to run."}
+    )
+    qa_dump_path: Optional[str] = field(
+        default=None,
+        metadata={"help": "Optional path to dump QA responses as JSONL for debugging."}
     )
     
     # Save dir (highest level directory)

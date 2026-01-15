@@ -11,6 +11,8 @@ import argparse
 # os.environ["LOG_LEVEL"] = "DEBUG"
 os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
+# 解决显存碎片化问题，让PyTorch更智能地管理显存
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 import logging
 
@@ -78,6 +80,7 @@ def main():
     parser.add_argument('--openie_mode', choices=['online', 'offline'], default='online',
                         help="OpenIE mode, offline denotes using VLLM offline batch mode for indexing, while online denotes")
     parser.add_argument('--save_dir', type=str, default='outputs', help='Save directory')
+    parser.add_argument('--qa_dump_path', type=str, default=None, help='Optional path to dump QA responses as JSONL')
     args = parser.parse_args()
 
     dataset_name = args.dataset
@@ -115,6 +118,7 @@ def main():
         llm_name=llm_name,
         dataset=dataset_name,
         embedding_model_name=args.embedding_name,
+        qa_dump_path=args.qa_dump_path,
         force_index_from_scratch=force_index_from_scratch,  # ignore previously stored index, set it to False if you want to use the previously stored index and embeddings
         force_openie_from_scratch=force_openie_from_scratch,
         rerank_dspy_file_path="src/hipporag/prompts/dspy_prompts/filter_llama3.3-70B-Instruct.json",
@@ -122,11 +126,16 @@ def main():
         linking_top_k=5,
         max_qa_steps=3,
         qa_top_k=5,
+        qa_num_workers=3,  # QA并发数设置为6
+        retrieval_num_workers=3,  # Retrieval并发数设置为6
         graph_type="facts_and_sim_passage_node_unidirectional",
-        embedding_batch_size=8,
+        embedding_batch_size=2, 
         max_new_tokens=None,
         corpus_len=len(corpus),
-        openie_mode=args.openie_mode
+        openie_mode=args.openie_mode,
+        # 量化配置 - 用于在8GB显存上运行NV-Embed-v2
+        use_quantization=True,  # 启用4-bit量化
+        quantization_bits=4,    # 使用4-bit NF4量化（显存~5.5GB，精度损失<1%）
     )
 
     logging.basicConfig(level=logging.INFO)

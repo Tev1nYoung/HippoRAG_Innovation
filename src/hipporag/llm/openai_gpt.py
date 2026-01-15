@@ -12,7 +12,7 @@ from filelock import FileLock
 from openai import OpenAI
 from openai import AzureOpenAI
 from packaging import version
-from tenacity import retry, stop_after_attempt, wait_fixed
+from tenacity import retry, retry_if_exception, stop_after_attempt, wait_random
 
 from ..utils.config_utils import BaseConfig
 from ..utils.llm_utils import (
@@ -34,16 +34,15 @@ def cache_response(func):
         if messages is None:
             raise ValueError("Missing required 'messages' parameter for caching.")
 
-        # get model, seed and temperature from kwargs or self.llm_config.generate_params
+        # get seed and temperature from kwargs or self.llm_config.generate_params
         gen_params = getattr(self, "llm_config", {}).generate_params if hasattr(self, "llm_config") else {}
-        model = kwargs.get("model", gen_params.get("model"))
         seed = kwargs.get("seed", gen_params.get("seed"))
         temperature = kwargs.get("temperature", gen_params.get("temperature"))
 
-        # build key data, convert to JSON string and hash to generate key_hash
+        # 缓存键只基于messages内容，不包含model字段
+        # 这样可以跨API服务商和模型名称复用缓存
         key_data = {
             "messages": messages,  # messages requires JSON serializable
-            "model": model,
             "seed": seed,
             "temperature": temperature,
         }
@@ -54,48 +53,66 @@ def cache_response(func):
         lock_file = self.cache_file_name + ".lock"
 
         # Try to read from SQLite cache
-        with FileLock(lock_file):
-            conn = sqlite3.connect(self.cache_file_name)
-            c = conn.cursor()
-            # if the table does not exist, create it
-            c.execute("""
-                CREATE TABLE IF NOT EXISTS cache (
-                    key TEXT PRIMARY KEY,
-                    message TEXT,
-                    metadata TEXT
-                )
-            """)
-            conn.commit()  # commit to save the table creation
-            c.execute("SELECT message, metadata FROM cache WHERE key = ?", (key_hash,))
-            row = c.fetchone()
-            conn.close()
-            if row is not None:
-                message, metadata_str = row
-                metadata = json.loads(metadata_str)
-                # return cached result and mark as hit
-                return message, metadata, True
+        lock = FileLock(lock_file, timeout=10)
+        try:
+            with lock:
+                conn = sqlite3.connect(self.cache_file_name)
+                c = conn.cursor()
+                # if the table does not exist, create it
+                c.execute("""
+                    CREATE TABLE IF NOT EXISTS cache (
+                        key TEXT PRIMARY KEY,
+                        message TEXT,
+                        metadata TEXT
+                    )
+                """)
+                conn.commit()  # commit to save the table creation
+                c.execute("SELECT message, metadata FROM cache WHERE key = ?", (key_hash,))
+                row = c.fetchone()
+                conn.close()
+                if row is not None:
+                    message, metadata_str = row
+                    metadata = json.loads(metadata_str)
+                    # return cached result and mark as hit
+                    return message, metadata, True
+        finally:
+            # 清理锁文件（如果没有其他进程在使用）
+            try:
+                if os.path.exists(lock_file) and not lock.is_locked:
+                    os.remove(lock_file)
+            except:
+                pass  # 忽略删除失败
 
         # if cache miss, call the original function to get the result
         result = func(self, *args, **kwargs)
         message, metadata = result
 
         # insert new result into cache
-        with FileLock(lock_file):
-            conn = sqlite3.connect(self.cache_file_name)
-            c = conn.cursor()
-            # make sure the table exists again (if it doesn't exist, it would be created)
-            c.execute("""
-                CREATE TABLE IF NOT EXISTS cache (
-                    key TEXT PRIMARY KEY,
-                    message TEXT,
-                    metadata TEXT
-                )
-            """)
-            metadata_str = json.dumps(metadata)
-            c.execute("INSERT OR REPLACE INTO cache (key, message, metadata) VALUES (?, ?, ?)",
-                      (key_hash, message, metadata_str))
-            conn.commit()
-            conn.close()
+        lock = FileLock(lock_file, timeout=10)
+        try:
+            with lock:
+                conn = sqlite3.connect(self.cache_file_name)
+                c = conn.cursor()
+                # make sure the table exists again (if it doesn't exist, it would be created)
+                c.execute("""
+                    CREATE TABLE IF NOT EXISTS cache (
+                        key TEXT PRIMARY KEY,
+                        message TEXT,
+                        metadata TEXT
+                    )
+                """)
+                metadata_str = json.dumps(metadata)
+                c.execute("INSERT OR REPLACE INTO cache (key, message, metadata) VALUES (?, ?, ?)",
+                          (key_hash, message, metadata_str))
+                conn.commit()
+                conn.close()
+        finally:
+            # 清理锁文件（如果没有其他进程在使用）
+            try:
+                if os.path.exists(lock_file) and not lock.is_locked:
+                    os.remove(lock_file)
+            except:
+                pass  # 忽略删除失败
 
         return message, metadata, False
 
@@ -104,8 +121,58 @@ def cache_response(func):
 def dynamic_retry_decorator(func):
     @functools.wraps(func)
     def wrapper(self, *args, **kwargs):
-        max_retries = getattr(self, "max_retries", 5)  
-        dynamic_retry = retry(stop=stop_after_attempt(max_retries), wait=wait_fixed(1))
+        max_retries = getattr(self, "max_retries", 5)
+        cooldown_min_s = getattr(self, "rate_limit_cooldown_min_s", 5)
+        cooldown_max_s = getattr(self, "rate_limit_cooldown_max_s", 8)
+
+        def _is_rate_limit_error(exc: BaseException) -> bool:
+            # 429速率限制错误
+            if isinstance(exc, openai.RateLimitError):
+                return True
+            if isinstance(exc, openai.APIStatusError) and getattr(exc, "status_code", None) == 429:
+                return True
+            if getattr(exc, "status_code", None) == 429:
+                return True
+            response = getattr(exc, "response", None)
+            if getattr(response, "status_code", None) == 429:
+                return True
+
+            # 常见的API错误码需要重试：
+            # 400: Bad Request (可能是临时格式问题)
+            # 401: Unauthorized (认证失败)
+            # 403: Forbidden (权限禁止)
+            # 408: Request Timeout (请求超时)
+            # 500: Internal Server Error (服务器内部错误)
+            # 502: Bad Gateway (网关错误)
+            # 503: Service Unavailable (服务不可用)
+            # 504: Gateway Timeout (网关超时)
+            # 524: Cloudflare特定超时错误
+            error_codes = [400, 401, 403, 408, 500, 502, 503, 504, 524]
+
+            if isinstance(exc, (openai.InternalServerError, openai.AuthenticationError,
+                              openai.PermissionDeniedError, openai.BadRequestError)):
+                return True
+            if isinstance(exc, openai.APIStatusError) and getattr(exc, "status_code", None) in error_codes:
+                return True
+            if getattr(exc, "status_code", None) in error_codes:
+                return True
+            if getattr(response, "status_code", None) in error_codes:
+                return True
+
+            # RuntimeError中包含错误码
+            if isinstance(exc, RuntimeError):
+                exc_str = str(exc)
+                if any(str(code) in exc_str for code in error_codes):
+                    return True
+
+            return False
+
+        dynamic_retry = retry(
+            stop=stop_after_attempt(max_retries),
+            wait=wait_random(min=cooldown_min_s, max=cooldown_max_s),
+            retry=retry_if_exception(_is_rate_limit_error),
+            reraise=True,
+        )
         decorated_func = dynamic_retry(func)
         return decorated_func(self, *args, **kwargs)
     return wrapper
@@ -136,19 +203,41 @@ class CacheOpenAI(BaseLLM):
         self.cache_file_name = os.path.join(self.cache_dir, cache_filename)
 
         self._init_llm_config()
+        fake_headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/120.0.0.0 Safari/537.36"
+            ),
+        }
         if high_throughput:
-            limits = httpx.Limits(max_connections=500, max_keepalive_connections=100)
-            client = httpx.Client(limits=limits, timeout=httpx.Timeout(5*60, read=5*60))
+            limits = httpx.Limits(max_connections=10, max_keepalive_connections=5)
+            client = httpx.Client(
+                limits=limits,
+                timeout=httpx.Timeout(5 * 60, read=5 * 60),
+                headers=fake_headers,
+            )
         else:
             client = None
 
-        self.max_retries = kwargs.get("max_retries", 2)
+        self.max_retries = kwargs.get("max_retries", getattr(global_config, "max_retry_attempts", 2))
+        self.rate_limit_cooldown_min_s = kwargs.get("rate_limit_cooldown_min_s", 15)
+        self.rate_limit_cooldown_max_s = kwargs.get("rate_limit_cooldown_max_s", 30)
 
         if self.global_config.azure_endpoint is None:
-            self.openai_client = OpenAI(base_url=self.llm_base_url, http_client=client, max_retries=self.max_retries)
+            self.openai_client = OpenAI(
+                base_url=self.llm_base_url,
+                http_client=client,
+                max_retries=0,
+                default_headers=fake_headers,
+            )
         else:
-            self.openai_client = AzureOpenAI(api_version=self.global_config.azure_endpoint.split('api-version=')[1],
-                                             azure_endpoint=self.global_config.azure_endpoint, max_retries=self.max_retries)
+            self.openai_client = AzureOpenAI(
+                api_version=self.global_config.azure_endpoint.split("api-version=")[1],
+                azure_endpoint=self.global_config.azure_endpoint,
+                max_retries=0,
+                default_headers=fake_headers,
+            )
 
     def _init_llm_config(self) -> None:
         config_dict = self.global_config.__dict__
@@ -185,15 +274,64 @@ class CacheOpenAI(BaseLLM):
 
         response = self.openai_client.chat.completions.create(**params)
 
-        response_message = response.choices[0].message.content
-        assert isinstance(response_message, str), "response_message should be a string"
-        
-        metadata = {
-            "prompt_tokens": response.usage.prompt_tokens, 
-            "completion_tokens": response.usage.completion_tokens,
-            "finish_reason": response.choices[0].finish_reason,
-        }
+        # 处理API返回字符串的情况（某些第三方API的问题）
+        if isinstance(response, str):
+            logger.warning(f"API returned string instead of response object: {response[:100]}")
+            # 检测HTML响应（通常是错误页面或重定向）
+            if response.strip().lower().startswith(('<!doctype', '<html', '<?xml')):
+                logger.error(f"API returned HTML page instead of JSON. This usually indicates API key issues, rate limiting, or service unavailability.")
+                raise openai.APIError(f"API returned HTML page: {response[:200]}")
+
+            # 尝试解析JSON
+            try:
+                import json
+                response_dict = json.loads(response)
+                response_message = response_dict.get('choices', [{}])[0].get('message', {}).get('content', response)
+                metadata = {
+                    "prompt_tokens": response_dict.get('usage', ).get('prompt_tokens', 0),
+                    "completion_tokens": response_dict.get('usage', {}).get('completion_tokens', 0),
+                    "finish_reason": response_dict.get('choices', [{}])[0].get('finish_reason', 'unknown'),
+                }
+            except:
+                # 如果解析失败，直接使用字符串作为响应
+                response_message = response
+                metadata = {
+                    "prompt_tokens": 0,
+                    "completion_tokens": 0,
+                    "finish_reason": "unknown",
+                }
+        else:
+            choices = getattr(response, "choices", None)
+            if not choices:
+                # 检查是否为API服务商错误（500/524等）
+                error_info = getattr(response, "error", None)
+                if error_info:
+                    error_code = error_info.get("code") if isinstance(error_info, dict) else None
+                    error_msg = error_info.get("message") if isinstance(error_info, dict) else str(error_info)
+                    logger.error(f"API服务商返回错误 (code: {error_code}): {error_msg}")
+                    raise RuntimeError(f"API服务商错误 (code: {error_code}): {error_msg}。完整响应: {response}")
+
+                logger.warning(f"OpenAI API returned empty choices: {response}")
+                usage = getattr(response, "usage", None)
+                response_message = ""
+                metadata = {
+                    "prompt_tokens": getattr(usage, "prompt_tokens", 0) if usage else 0,
+                    "completion_tokens": getattr(usage, "completion_tokens", 0) if usage else 0,
+                    "finish_reason": "error",
+                }
+            else:
+                choice = choices[0]
+                message = getattr(choice, "message", None)
+                response_message = getattr(message, "content", None)
+                if not isinstance(response_message, str):
+                    logger.warning("OpenAI API returned non-string message content.")
+                    response_message = "" if response_message is None else str(response_message)
+
+                usage = getattr(response, "usage", None)
+                metadata = {
+                    "prompt_tokens": getattr(usage, "prompt_tokens", 0) if usage else 0,
+                    "completion_tokens": getattr(usage, "completion_tokens", 0) if usage else 0,
+                    "finish_reason": getattr(choice, "finish_reason", None) or "unknown",
+                }
 
         return response_message, metadata
-
-

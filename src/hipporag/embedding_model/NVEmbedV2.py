@@ -4,7 +4,7 @@ from typing import List, Optional
 import numpy as np
 import torch
 from tqdm import tqdm
-from transformers import AutoModel
+from transformers import AutoModel, BitsAndBytesConfig
 
 from ..utils.config_utils import BaseConfig
 from ..utils.logging_utils import get_logger
@@ -30,28 +30,60 @@ class NVEmbedV2EmbeddingModel(BaseEmbeddingModel):
         self.embedding_model = AutoModel.from_pretrained(**self.embedding_config.model_init_params)
         self.embedding_dim = self.embedding_model.config.hidden_size
 
+
+
     def _init_embedding_config(self) -> None:
         """
         Extract embedding model-specific parameters to init the EmbeddingConfig.
-        
+
         Returns:
             None
         """
 
+        # 检查是否需要量化
+        use_quantization = getattr(self.global_config, 'use_quantization', False)
+        quantization_bits = getattr(self.global_config, 'quantization_bits', 4)
+
+        model_init_params = {
+            "pretrained_model_name_or_path": self.embedding_model_name,
+            "trust_remote_code": True,
+            'device_map': "auto",
+            "torch_dtype": self.global_config.embedding_model_dtype,
+        }
+
+        # 如果启用量化，添加量化配置
+        if use_quantization:
+            logger.info(f"启用 {quantization_bits}-bit 量化加载 NV-Embed-v2")
+
+            if quantization_bits == 4:
+                # 4-bit NF4量化配置（推荐）
+                bnb_config = BitsAndBytesConfig(
+                    load_in_4bit=True,
+                    bnb_4bit_quant_type="nf4",  # Normal Float 4
+                    bnb_4bit_compute_dtype=torch.bfloat16,
+                    bnb_4bit_use_double_quant=True,  # 双重量化
+                )
+                model_init_params["quantization_config"] = bnb_config
+                logger.info("使用4-bit NF4量化，预计显存占用: ~5.5GB")
+
+            elif quantization_bits == 8:
+                # 8-bit量化配置
+                bnb_config = BitsAndBytesConfig(
+                    load_in_8bit=True,
+                )
+                model_init_params["quantization_config"] = bnb_config
+                logger.info("使用8-bit量化，预计显存占用: ~7.8GB")
+            else:
+                logger.warning(f"不支持的量化位数: {quantization_bits}，将使用FP16/BF16")
+        else:
+            logger.info("未启用量化，使用FP16/BF16加载（需要~15.6GB显存）")
+
         config_dict = {
             "embedding_model_name": self.embedding_model_name,
             "norm": self.global_config.embedding_return_as_normalized,
-            # "max_seq_length": self.global_config.embedding_max_seq_len,
-            "model_init_params": {
-                # "model_name_or_path": self.embedding_model_name2mode_name_or_path[self.embedding_model_name],
-                "pretrained_model_name_or_path": self.embedding_model_name,
-                "trust_remote_code": True,
-                'device_map': "auto",  # added this line to use multiple GPUs
-                "torch_dtype": self.global_config.embedding_model_dtype,
-                # **kwargs
-            },
+            "model_init_params": model_init_params,
             "encode_params": {
-                "max_length": self.global_config.embedding_max_seq_len,  # 32768 from official example,
+                "max_length": self.global_config.embedding_max_seq_len,
                 "instruction": "",
                 "batch_size": self.global_config.embedding_batch_size,
                 "num_workers": 32
@@ -59,11 +91,8 @@ class NVEmbedV2EmbeddingModel(BaseEmbeddingModel):
         }
 
         self.embedding_config = EmbeddingConfig.from_dict(config_dict=config_dict)
-        logger.debug(f"Init {self.__class__.__name__}'s embedding_config: {self.embedding_config}")
-
-    # def _add_eos(self, texts: List[str]) -> List[str]:
-    #     # Adds EOS token to each text
-    #     return [text + self.embedding_model.tokenizer.eos_token for text in texts]
+        # 注意：不打印包含BitsAndBytesConfig的配置，因为它不能被JSON序列化
+        logger.debug(f"Init {self.__class__.__name__}'s embedding_config (quantization={use_quantization})")
 
     def batch_encode(self, texts: List[str], **kwargs) -> None:
         if isinstance(texts, str): texts = [texts]
@@ -74,13 +103,12 @@ class NVEmbedV2EmbeddingModel(BaseEmbeddingModel):
         if "instruction" in kwargs:
             if kwargs["instruction"] != '':
                 params["instruction"] = f"Instruct: {kwargs['instruction']}\nQuery: "
-            # del params["instruction"]
 
         batch_size = params.pop("batch_size", 16)
 
-        logger.debug(f"Calling {self.__class__.__name__} with:\n{params}")
+        logger.debug(f"Calling {self.__class__.__name__} with batch_size={batch_size}")
         if len(texts) <= batch_size:
-            params["prompts"] = texts  # self._add_eos(texts=texts)
+            params["prompts"] = texts
             results = self.embedding_model.encode(**params)
         else:
             pbar = tqdm(total=len(texts), desc="Batch Encoding")

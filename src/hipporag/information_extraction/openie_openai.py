@@ -1,3 +1,4 @@
+import ast
 import json
 import re
 from dataclasses import dataclass
@@ -33,7 +34,7 @@ def _extract_ner_from_response(real_response):
     if match is None:
         # If pattern doesn't match, return an empty list
         return []
-    return eval(match.group())["named_entities"]
+    return ast.literal_eval(match.group())["named_entities"]
 
 
 class OpenIE:
@@ -85,7 +86,7 @@ class OpenIE:
             if match is None:
                 # If pattern doesn't match, return an empty list
                 return []
-            return eval(match.group())["triples"]
+            return ast.literal_eval(match.group())["triples"]
 
         # PREPROCESSING
         messages = self.prompt_template_manager.render(
@@ -154,7 +155,7 @@ class OpenIE:
         total_completion_tokens = 0
         num_cache_hit = 0
 
-        with ThreadPoolExecutor() as executor:
+        with ThreadPoolExecutor(max_workers=5) as executor:
             # Create NER futures for each chunk
             ner_futures = {
                 executor.submit(self.ner, chunk_key, passage): chunk_key
@@ -180,7 +181,7 @@ class OpenIE:
 
         triple_results_list = []
         total_prompt_tokens, total_completion_tokens, num_cache_hit = 0, 0, 0
-        with ThreadPoolExecutor() as executor:
+        with ThreadPoolExecutor(max_workers=5) as executor:
             # Create triple extraction futures for each chunk
             re_futures = {
                 executor.submit(self.triple_extraction, ner_result.chunk_id,

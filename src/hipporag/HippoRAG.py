@@ -17,7 +17,7 @@ from collections import defaultdict, Counter
 import re
 import time
 
-from .llm import _get_llm_class, BaseLLM
+from .llm import _get_llm_class, BaseLLM, _find_existing_openie_file, _find_existing_working_dir
 from .embedding_model import _get_embedding_model_class, BaseEmbeddingModel
 from .embedding_store import EmbeddingStore
 from .information_extraction import OpenIE
@@ -113,19 +113,30 @@ class HippoRAG:
         _print_config = ",\n  ".join([f"{k} = {v}" for k, v in asdict(self.global_config).items()])
         logger.debug(f"HippoRAG init with config:\n  {_print_config}\n")
 
-        #LLM and embedding model specific working directories are created under every specified saving directories
-        llm_label = self.global_config.llm_name.replace("/", "_").replace(":", "_")
-        embedding_label = self.global_config.embedding_model_name.replace("/", "_").replace(":", "_")
-        self.working_dir = os.path.join(self.global_config.save_dir, f"{llm_label}_{embedding_label}")
+        # 使用模糊匹配查找已存在的工作目录（LLM模糊 + Embedding精确）
+        self.working_dir = _find_existing_working_dir(
+            self.global_config.save_dir,
+            self.global_config.llm_name,
+            self.global_config.embedding_model_name
+        )
 
         if not os.path.exists(self.working_dir):
-            logger.info(f"Creating working directory: {self.working_dir}")
+            logger.info(f"创建工作目录: {self.working_dir}")
             os.makedirs(self.working_dir, exist_ok=True)
 
-        self.llm_model: BaseLLM = _get_llm_class(self.global_config)
+        # 为OpenIE创建独立的LLM实例，使用openie_cache.sqlite
+        self.openie_llm_model: BaseLLM = _get_llm_class(self.global_config, cache_suffix='openie')
+        logger.info(f"OpenIE LLM使用独立缓存: openie_cache.sqlite")
+
+        # 为Retrieval创建独立的LLM实例，使用retrieval_cache.sqlite
+        self.retrieval_llm_model: BaseLLM = _get_llm_class(self.global_config, cache_suffix='retrieval')
+        logger.info(f"Retrieval LLM使用独立缓存: retrieval_cache.sqlite")
+
+        # 保留默认llm_model用于向后兼容（如果有其他地方使用）
+        self.llm_model: BaseLLM = self.openie_llm_model
 
         if self.global_config.openie_mode == 'online':
-            self.openie = OpenIE(llm_model=self.llm_model)
+            self.openie = OpenIE(llm_model=self.openie_llm_model)
         elif self.global_config.openie_mode == 'offline':
             self.openie = VLLMOfflineOpenIE(self.global_config)
         elif self.global_config.openie_mode ==  'Transformers-offline':
@@ -151,9 +162,17 @@ class HippoRAG:
 
         self.prompt_template_manager = PromptTemplateManager(role_mapping={"system": "system", "user": "user", "assistant": "assistant"})
 
-        self.openie_results_path = os.path.join(self.global_config.save_dir,f'openie_results_ner_{self.global_config.llm_name.replace("/", "_").replace(":", "_")}.json')
+        # 使用模糊匹配查找已存在的OpenIE结果文件（只匹配LLM）
+        self.openie_results_path = _find_existing_openie_file(
+            self.global_config.save_dir,
+            self.global_config.llm_name
+        )
 
+        # 注意：DSPyFilter会使用self.llm_model，所以临时设置为retrieval_llm_model
+        original_llm_model = self.llm_model
+        self.llm_model = self.retrieval_llm_model
         self.rerank_filter = DSPyFilter(self)
+        self.llm_model = original_llm_model  # 恢复为openie_llm_model
 
         self.ready_to_retrieve = False
 
@@ -194,13 +213,13 @@ class HippoRAG:
             return ig.Graph(directed=self.global_config.is_directed_graph)
         else:
             logger.info(
-                f"Loaded graph from {self._graph_pickle_filename} with {preloaded_graph.vcount()} nodes, {preloaded_graph.ecount()} edges"
+                f"从 {self._graph_pickle_filename} 加载图，包含 {preloaded_graph.vcount()} 个节点，{preloaded_graph.ecount()} 条边"
             )
             return preloaded_graph
 
     def pre_openie(self,  docs: List[str]):
-        logger.info(f"Indexing Documents")
-        logger.info(f"Performing OpenIE Offline")
+        logger.info(f"索引文档")
+        logger.info(f"执行离线OpenIE")
 
         chunks = self.chunk_embedding_store.get_missing_string_hash_ids(docs)
 
@@ -226,9 +245,9 @@ class HippoRAG:
                 A list of documents to be indexed.
         """
 
-        logger.info(f"Indexing Documents")
+        logger.info(f"索引文档")
 
-        logger.info(f"Performing OpenIE")
+        logger.info(f"执行OpenIE")
 
         if self.global_config.openie_mode == 'offline':
             self.pre_openie(docs)
@@ -257,13 +276,13 @@ class HippoRAG:
         entity_nodes, chunk_triple_entities = extract_entity_nodes(chunk_triples)
         facts = flatten_facts(chunk_triples)
 
-        logger.info(f"Encoding Entities")
+        logger.info(f"编码实体")
         self.entity_embedding_store.insert_strings(entity_nodes)
 
-        logger.info(f"Encoding Facts")
+        logger.info(f"编码事实")
         self.fact_embedding_store.insert_strings([str(fact) for fact in facts])
 
-        logger.info(f"Constructing Graph")
+        logger.info(f"构建图")
 
         self.node_to_node_stats = {}
         self.ent_node_to_chunk_ids = {}
@@ -272,7 +291,7 @@ class HippoRAG:
         num_new_chunks = self.add_passage_edges(chunk_ids, chunk_triple_entities)
 
         if num_new_chunks > 0:
-            logger.info(f"Found {num_new_chunks} new chunks to save into graph.")
+            logger.info(f"找到 {num_new_chunks} 个新文档块保存到图中")
             self.add_synonymy_edges()
 
             self.augment_graph()
@@ -345,9 +364,9 @@ class HippoRAG:
             if len(non_deleted_docs) == 0:
                 filtered_ent_ids_to_delete.append(ent_node)
 
-        logger.info(f"Deleting {len(chunk_ids_to_delete)} Chunks")
-        logger.info(f"Deleting {len(triple_ids_to_delete)} Triples")
-        logger.info(f"Deleting {len(filtered_ent_ids_to_delete)} Entities")
+        logger.info(f"删除 {len(chunk_ids_to_delete)} 个文档块")
+        logger.info(f"删除 {len(triple_ids_to_delete)} 个三元组")
+        logger.info(f"删除 {len(filtered_ent_ids_to_delete)} 个实体")
 
         self.save_openie_results(all_openie_info_with_deletes)
 
@@ -408,13 +427,97 @@ class HippoRAG:
         retrieval_results = []
         mode_counts = Counter()
 
-        for q_idx, query in tqdm(enumerate(queries), desc="Retrieving", total=len(queries)):
+        # 准备保存retrieval responses到JSONL文件
+        retrieval_dump_path = os.path.join(self.working_dir, "retrieval_responses.jsonl")
+        retrieval_dump_file = None
+
+        if retrieval_dump_path:
+            dump_dir = os.path.dirname(retrieval_dump_path)
+            if dump_dir:
+                os.makedirs(dump_dir, exist_ok=True)
+
+            # 检查文件是否已存在
+            file_exists = os.path.exists(retrieval_dump_path)
+
+            # 去重：检查最后一次运行的Retrieval记录是否与当前相同
+            should_skip = False
+            if file_exists:
+                try:
+                    with open(retrieval_dump_path, "r", encoding="utf-8") as f:
+                        lines = f.readlines()
+
+                    # 找到最后一个run_separator和对应的Retrieval记录
+                    last_retrieval_records = []
+                    last_separator = None
+                    for i in range(len(lines) - 1, -1, -1):
+                        line = lines[i].strip()
+                        if not line or line.startswith("="):
+                            continue
+                        try:
+                            record = json.loads(line)
+                            if record.get("type") == "run_separator":
+                                last_separator = record
+                                break
+                            if "question" in record:  # 这是Retrieval记录
+                                last_retrieval_records.insert(0, record)
+                        except:
+                            continue
+
+                    # 只有当最后一次运行的method与当前相同且模型相同时才检查去重
+                    if last_separator and last_separator.get("method") == "HippoRAG":
+                        # 检查模型是否相同（使用模糊匹配）
+                        from .llm import _extract_model_keywords
+                        last_llm_keywords = _extract_model_keywords(last_separator.get("llm_name", ""))
+                        current_llm_keywords = _extract_model_keywords(self.global_config.llm_name)
+                        models_match = (last_llm_keywords == current_llm_keywords) if last_llm_keywords and current_llm_keywords else (last_separator.get("llm_name") == self.global_config.llm_name)
+
+                        if models_match and len(last_retrieval_records) == len(queries):
+                            all_same = True
+                            for idx, query in enumerate(queries):
+                                last_record = last_retrieval_records[idx]
+                                if last_record.get("question") != query:
+                                    all_same = False
+                                    break
+
+                            if all_same:
+                                should_skip = True
+                                logger.info("检索响应与上次运行相同，跳过保存以避免重复")
+                except Exception as e:
+                    logger.debug(f"Failed to check for duplicate Retrieval records: {e}")
+
+            if should_skip:
+                retrieval_dump_file = None
+            else:
+                retrieval_dump_file = open(retrieval_dump_path, "a", encoding="utf-8")
+
+                # 如果文件已存在，添加分隔行
+                if file_exists:
+                    retrieval_dump_file.write("\n")
+                    retrieval_dump_file.write("\n")
+                    retrieval_dump_file.write("\n")
+
+                # 写入本次运行的时间戳和配置信息
+                from datetime import datetime
+                run_timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                separator_record = {
+                    "type": "run_separator",
+                    "timestamp": run_timestamp,
+                    "method": "HippoRAG",
+                    "llm_name": self.global_config.llm_name,
+                    "llm_base_url": self.global_config.llm_base_url,
+                    "embedding_name": self.global_config.embedding_model_name,
+                    "dataset": self.global_config.dataset,
+                    "num_queries": len(queries),
+                }
+                retrieval_dump_file.write(json.dumps(separator_record, ensure_ascii=False, default=str) + "\n")
+                retrieval_dump_file.write("=" * 80 + "\n")
+
+        # 定义单个query的retrieval函数
+        def retrieve_single_query(q_idx, query):
             rerank_start = time.time()
             query_fact_scores = self.get_fact_scores(query)
             top_k_fact_indices, top_k_facts, rerank_log = self.rerank_facts(query, query_fact_scores)
             rerank_end = time.time()
-
-            self.rerank_time += rerank_end - rerank_start
 
             if len(top_k_facts) == 0:
                 sorted_doc_ids, sorted_doc_scores = self.dense_passage_retrieval(query)
@@ -430,31 +533,105 @@ class HippoRAG:
                 mode = "ppr"
                 logger.info(f"[Retrieval][PPR] Query #{q_idx}: graph search with {len(top_k_facts)} facts.")
 
-            mode_counts[mode] += 1
-
             top_k_docs = [self.chunk_embedding_store.get_row(self.passage_node_keys[idx])["content"] for idx in sorted_doc_ids[:num_to_retrieve]]
 
-            retrieval_results.append(QuerySolution(question=query, docs=top_k_docs, doc_scores=sorted_doc_scores[:num_to_retrieve]))
+            retrieval_dump_record = None
+            if retrieval_dump_file:
+                from datetime import datetime
+                retrieval_dump_record = {
+                    "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3],
+                    "index": q_idx,
+                    "question": query,
+                    "retrieval_mode": mode,
+                    "num_facts": len(top_k_facts) if mode == "ppr" else 0,
+                    "num_retrieved_docs": len(top_k_docs),
+                    "top_doc_scores": [float(score) for score in sorted_doc_scores[:5]],
+                    "retrieved_doc_previews": [doc[:100] + "..." if len(doc) > 100 else doc for doc in top_k_docs[:3]],
+                    "rerank_time": rerank_end - rerank_start,
+                }
+
+            return {
+                "result": QuerySolution(question=query, docs=top_k_docs, doc_scores=sorted_doc_scores[:num_to_retrieve]),
+                "mode": mode,
+                "rerank_time": rerank_end - rerank_start,
+                "dump_record": retrieval_dump_record
+            }
+
+        # 使用并发或串行处理
+        retrieval_num_workers = max(1, int(getattr(self.global_config, "retrieval_num_workers", 1) or 1))
+
+        if retrieval_num_workers == 1:
+            # 串行处理
+            for q_idx, query in tqdm(enumerate(queries), desc="Retrieving", total=len(queries)):
+                result_dict = retrieve_single_query(q_idx, query)
+                retrieval_results.append(result_dict["result"])
+                mode_counts[result_dict["mode"]] += 1
+                self.rerank_time += result_dict["rerank_time"]
+
+                if retrieval_dump_file and result_dict["dump_record"]:
+                    retrieval_dump_file.write(json.dumps(result_dict["dump_record"], ensure_ascii=False, default=str) + "\n")
+        else:
+            # 并发处理
+            with ThreadPoolExecutor(max_workers=retrieval_num_workers) as executor:
+                futures = {executor.submit(retrieve_single_query, q_idx, query): q_idx
+                          for q_idx, query in enumerate(queries)}
+
+                # 按顺序收集结果
+                results_dict = {}
+                for future in tqdm(futures, desc="Retrieving", total=len(queries)):
+                    q_idx = futures[future]
+                    try:
+                        result_dict = future.result()
+                        results_dict[q_idx] = result_dict
+                    except Exception as e:
+                        # 检查是否为401认证错误
+                        error_msg = str(e)
+                        if "401" in error_msg or "无效的令牌" in error_msg or "Invalid" in error_msg:
+                            # 取消所有未完成的任务
+                            for f in futures:
+                                f.cancel()
+                            logger.error(f"检测到API认证错误(401)，立即停止执行: {error_msg}")
+                            raise RuntimeError(f"API认证失败(401错误)，请检查您的API密钥是否有效。错误详情: {error_msg}") from e
+                        else:
+                            # 其他错误也抛出
+                            raise
+
+                # 按原始顺序添加结果
+                for q_idx in range(len(queries)):
+                    result_dict = results_dict[q_idx]
+                    retrieval_results.append(result_dict["result"])
+                    mode_counts[result_dict["mode"]] += 1
+                    self.rerank_time += result_dict["rerank_time"]
+
+                    if retrieval_dump_file and result_dict["dump_record"]:
+                        retrieval_dump_file.write(json.dumps(result_dict["dump_record"], ensure_ascii=False, default=str) + "\n")
+
+        # 关闭retrieval dump文件
+        if retrieval_dump_file:
+            retrieval_dump_file.close()
+            logger.info("检索响应已保存到 %s", retrieval_dump_path)
 
         retrieve_end_time = time.time()  # Record end time
 
         self.last_retrieval_mode_counts = dict(mode_counts)
         self.all_retrieval_time += retrieve_end_time - retrieve_start_time
 
-        logger.info(f"Total Retrieval Time {self.all_retrieval_time:.2f}s")
-        logger.info(f"Total Recognition Memory Time {self.rerank_time:.2f}s")
-        logger.info(f"Total PPR Time {self.ppr_time:.2f}s")
-        logger.info(f"Total Misc Time {self.all_retrieval_time - (self.rerank_time + self.ppr_time):.2f}s")
+        logger.info(f"总检索时间 {self.all_retrieval_time:.2f}s")
+        logger.info(f"总识别记忆时间 {self.rerank_time:.2f}s")
+        logger.info(f"总PPR时间 {self.ppr_time:.2f}s")
+        logger.info(f"总杂项时间 {self.all_retrieval_time - (self.rerank_time + self.ppr_time):.2f}s")
 
         # Evaluate retrieval
         if gold_docs is not None:
             k_list = [1, 2, 5, 10, 20, 30, 50, 100, 150, 200]
             overall_retrieval_result, example_retrieval_results = retrieval_recall_evaluator.calculate_metric_scores(gold_docs=gold_docs, retrieved_docs=[retrieval_result.docs for retrieval_result in retrieval_results], k_list=k_list)
             overall_retrieval_result["retrieval_mode_counts"] = dict(mode_counts)
-            logger.info(f"Evaluation results for retrieval: {overall_retrieval_result}")
+            logger.info(f"检索评估结果: {overall_retrieval_result}")
 
-            # Save retrieval metrics to file
-            self._save_evaluation_metrics(overall_retrieval_result, None, source="HippoRAG.retrieve")
+            # Save retrieval metrics to file (only if not called from rag_qa)
+            # rag_qa will save both retrieval and qa metrics together
+            if not hasattr(self, '_skip_retrieval_save') or not self._skip_retrieval_save:
+                self._save_evaluation_metrics(overall_retrieval_result, None, source="HippoRAG.retrieve")
 
             return retrieval_results, overall_retrieval_result
         else:
@@ -501,10 +678,13 @@ class HippoRAG:
         overall_retrieval_result = None
 
         if not isinstance(queries[0], QuerySolution):
+            # 设置标志，让retrieve()不保存metrics（我们会在这里一次性保存）
+            self._skip_retrieval_save = True
             if gold_docs is not None:
                 queries, overall_retrieval_result = self.retrieve(queries=queries, gold_docs=gold_docs)
             else:
                 queries = self.retrieve(queries=queries)
+            self._skip_retrieval_save = False
 
         # Performing QA
         queries_solutions, all_response_message, all_metadata = self.qa(queries)
@@ -522,7 +702,7 @@ class HippoRAG:
             overall_qa_em_result.update(overall_qa_f1_result)
             overall_qa_results = overall_qa_em_result
             overall_qa_results = {k: round(float(v), 4) for k, v in overall_qa_results.items()}
-            logger.info(f"Evaluation results for QA: {overall_qa_results}")
+            logger.info(f"问答评估结果: {overall_qa_results}")
 
             # Save retrieval and QA results
             for idx, q in enumerate(queries_solutions):
@@ -530,8 +710,8 @@ class HippoRAG:
                 if gold_docs is not None:
                     q.gold_docs = gold_docs[idx]
 
-            # Save/update evaluation metrics to file (QA metrics will be merged with existing retrieval metrics if any)
-            self._save_evaluation_metrics(None, overall_qa_results, source="HippoRAG.rag_qa")
+            # Save both retrieval and QA metrics together in one record
+            self._save_evaluation_metrics(overall_retrieval_result, overall_qa_results, source="HippoRAG.rag_qa")
 
             return queries_solutions, all_response_message, all_metadata, overall_retrieval_result, overall_qa_results
         else:
@@ -581,7 +761,7 @@ class HippoRAG:
         retrieval_results = []
 
         for q_idx, query in tqdm(enumerate(queries), desc="Retrieving", total=len(queries)):
-            logger.info('No facts found after reranking, return DPR results')
+            logger.info('重排序后未找到事实，返回DPR结果')
             sorted_doc_ids, sorted_doc_scores = self.dense_passage_retrieval(query)
 
             top_k_docs = [self.chunk_embedding_store.get_row(self.passage_node_keys[idx])["content"] for idx in
@@ -594,7 +774,7 @@ class HippoRAG:
 
         self.all_retrieval_time += retrieve_end_time - retrieve_start_time
 
-        logger.info(f"Total Retrieval Time {self.all_retrieval_time:.2f}s")
+        logger.info(f"总检索时间 {self.all_retrieval_time:.2f}s")
 
         # Evaluate retrieval
         if gold_docs is not None:
@@ -602,7 +782,7 @@ class HippoRAG:
             overall_retrieval_result, example_retrieval_results = retrieval_recall_evaluator.calculate_metric_scores(
                 gold_docs=gold_docs, retrieved_docs=[retrieval_result.docs for retrieval_result in retrieval_results],
                 k_list=k_list)
-            logger.info(f"Evaluation results for retrieval: {overall_retrieval_result}")
+            logger.info(f"检索评估结果: {overall_retrieval_result}")
 
             return retrieval_results, overall_retrieval_result
         else:
@@ -670,7 +850,7 @@ class HippoRAG:
             overall_qa_em_result.update(overall_qa_f1_result)
             overall_qa_results = overall_qa_em_result
             overall_qa_results = {k: round(float(v), 4) for k, v in overall_qa_results.items()}
-            logger.info(f"Evaluation results for QA: {overall_qa_results}")
+            logger.info(f"问答评估结果: {overall_qa_results}")
 
             # Save retrieval and QA results
             for idx, q in enumerate(queries_solutions):
@@ -697,6 +877,10 @@ class HippoRAG:
                 - A list of raw response messages from the language model.
                 - A list of metadata dictionaries associated with the results.
         """
+        # 为QA阶段创建独立的LLM实例，使用qa_cache.sqlite
+        qa_llm_model = _get_llm_class(self.global_config, cache_suffix='qa')
+        logger.info(f"QA LLM使用独立缓存: qa_cache.sqlite")
+
         #Running inference for QA
         all_qa_messages = []
 
@@ -721,23 +905,177 @@ class HippoRAG:
             all_qa_messages.append(
                 self.prompt_template_manager.render(name=f'rag_qa_{prompt_dataset_name}', prompt_user=prompt_user))
 
-        all_qa_results = [self.llm_model.infer(qa_messages) for qa_messages in tqdm(all_qa_messages, desc="QA Reading")]
+        qa_num_workers = max(1, int(getattr(self.global_config, "qa_num_workers", 1) or 1))
+        if qa_num_workers == 1:
+            all_qa_results = [
+                qa_llm_model.infer(qa_messages)
+                for qa_messages in tqdm(all_qa_messages, desc="QA Reading")
+            ]
+        else:
+            with ThreadPoolExecutor(max_workers=qa_num_workers) as executor:
+                results_iterator = executor.map(qa_llm_model.infer, all_qa_messages)
+                all_qa_results = list(
+                    tqdm(results_iterator, total=len(all_qa_messages), desc="QA Reading")
+                )
 
         all_response_message, all_metadata, all_cache_hit = zip(*all_qa_results)
-        all_response_message, all_metadata = list(all_response_message), list(all_metadata)
+        all_response_message = list(all_response_message)
+        all_metadata = list(all_metadata)
+        all_cache_hit = list(all_cache_hit)
+
+        # 自动设置QA导出路径（如果用户未指定）
+        qa_dump_path = getattr(self.global_config, "qa_dump_path", None)
+        if qa_dump_path is None:
+            # 自动生成路径：outputs/<dataset>/<llm>_<embedding>/qa_responses.jsonl
+            qa_dump_path = os.path.join(self.working_dir, "qa_responses.jsonl")
+            logger.info(f"QA导出路径未指定，自动生成: {qa_dump_path}")
+
+        qa_dump_file = None
+        if qa_dump_path:
+            dump_dir = os.path.dirname(qa_dump_path)
+            if dump_dir:
+                os.makedirs(dump_dir, exist_ok=True)
+
+            # 检查文件是否已存在，如果存在则追加分隔符
+            file_exists = os.path.exists(qa_dump_path)
+
+            # 去重：检查最后一次运行的QA记录是否与当前相同
+            should_skip = False
+            if file_exists:
+                try:
+                    with open(qa_dump_path, "r", encoding="utf-8") as f:
+                        lines = f.readlines()
+
+                    # 找到最后一个run_separator和对应的QA记录
+                    last_qa_records = []
+                    last_separator = None
+                    for i in range(len(lines) - 1, -1, -1):
+                        line = lines[i].strip()
+                        if not line or line.startswith("="):
+                            continue
+                        try:
+                            record = json.loads(line)
+                            if record.get("type") == "run_separator":
+                                last_separator = record
+                                break
+                            if "question" in record:  # 这是QA记录
+                                last_qa_records.insert(0, record)
+                        except:
+                            continue
+
+                    # 只有当最后一次运行的method与当前相同且模型相同时才检查去重
+                    if last_separator and last_separator.get("method") == "HippoRAG":
+                        # 检查模型是否相同（使用模糊匹配）
+                        from .llm import _extract_model_keywords
+                        last_llm_keywords = _extract_model_keywords(last_separator.get("llm_name", ""))
+                        current_llm_keywords = _extract_model_keywords(self.global_config.llm_name)
+                        models_match = (last_llm_keywords == current_llm_keywords) if last_llm_keywords and current_llm_keywords else (last_separator.get("llm_name") == self.global_config.llm_name)
+
+                        if models_match and len(last_qa_records) == len(queries):
+                            all_same = True
+                            for idx, query in enumerate(queries):
+                                last_record = last_qa_records[idx]
+                                current_response = all_response_message[idx]
+                                if last_record.get("question") != query.question or last_record.get("response") != current_response:
+                                    all_same = False
+                                    break
+
+                            if all_same:
+                                should_skip = True
+                                logger.info("问答响应与上次运行相同，跳过保存以避免重复")
+                except Exception as e:
+                    logger.debug(f"Failed to check for duplicate QA records: {e}")
+
+            if should_skip:
+                qa_dump_file = None
+            else:
+                qa_dump_file = open(qa_dump_path, "a", encoding="utf-8")  # 使用追加模式
+
+                # 如果文件已存在，添加分隔行
+                if file_exists:
+                    qa_dump_file.write("\n")  # 空行
+                    qa_dump_file.write("\n")  # 空行
+                    qa_dump_file.write("\n")  # 空行
+
+                # 写入本次运行的时间戳和配置信息
+                from datetime import datetime
+                run_timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                separator_record = {
+                    "type": "run_separator",
+                    "timestamp": run_timestamp,
+                    "method": "HippoRAG",
+                    "llm_name": self.global_config.llm_name,
+                    "llm_base_url": self.global_config.llm_base_url,
+                    "embedding_name": self.global_config.embedding_model_name,
+                    "dataset": self.global_config.dataset,
+                    "num_queries": len(queries),
+                }
+                qa_dump_file.write(json.dumps(separator_record, ensure_ascii=False, default=str) + "\n")
+                qa_dump_file.write("=" * 80 + "\n")  # 分隔线
 
         #Process responses and extract predicted answers.
         queries_solutions = []
         for query_solution_idx, query_solution in tqdm(enumerate(queries), desc="Extraction Answers from LLM Response"):
             response_content = all_response_message[query_solution_idx]
-            try:
-                pred_ans = response_content.split('Answer:')[1].strip()
-            except Exception as e:
-                logger.warning(f"Error in parsing the answer from the raw LLM QA inference response: {str(e)}!")
-                pred_ans = response_content
+            metadata = all_metadata[query_solution_idx] if query_solution_idx < len(all_metadata) else {}
+
+            invalid_reason = None
+            if response_content is None:
+                invalid_reason = "empty_response"
+            elif not isinstance(response_content, str):
+                invalid_reason = f"non_string_response:{type(response_content).__name__}"
+            else:
+                stripped_response = response_content.strip()
+                if not stripped_response:
+                    invalid_reason = "blank_response"
+                else:
+                    lower_response = stripped_response.lower()
+                    if isinstance(metadata, dict) and metadata.get("finish_reason") == "error":
+                        invalid_reason = "finish_reason_error"
+                    elif stripped_response.startswith("{") and "error" in lower_response:
+                        invalid_reason = "error_json"
+                    elif lower_response.startswith(("error", "exception", "traceback")):
+                        invalid_reason = "error_prefix"
+                    elif "rate limit" in lower_response or "quota" in lower_response:
+                        invalid_reason = "rate_limit"
+
+            if invalid_reason:
+                logger.warning(
+                    "Invalid QA response detected (idx=%s, reason=%s).",
+                    query_solution_idx,
+                    invalid_reason,
+                )
+                if isinstance(metadata, dict):
+                    metadata["qa_error"] = True
+                    metadata["qa_error_reason"] = invalid_reason
+                pred_ans = ""
+            else:
+                try:
+                    pred_ans = response_content.split('Answer:')[1].strip()
+                except Exception as e:
+                    logger.warning(f"Error in parsing the answer from the raw LLM QA inference response: {str(e)}!")
+                    pred_ans = response_content
 
             query_solution.answer = pred_ans
             queries_solutions.append(query_solution)
+
+            if qa_dump_file:
+                from datetime import datetime
+                qa_dump_record = {
+                    "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3],  # 精确到毫秒
+                    "index": query_solution_idx,
+                    "question": query_solution.question,
+                    "answer": pred_ans,
+                    "response": response_content,
+                    "metadata": metadata,
+                    "cache_hit": all_cache_hit[query_solution_idx] if query_solution_idx < len(all_cache_hit) else None,
+                    "invalid_reason": invalid_reason,
+                }
+                qa_dump_file.write(json.dumps(qa_dump_record, ensure_ascii=False, default=str) + "\n")
+
+        if qa_dump_file:
+            qa_dump_file.close()
+            logger.info("问答响应已保存到 %s", qa_dump_path)
 
         return queries_solutions, all_response_message, all_metadata
 
@@ -766,7 +1104,7 @@ class HippoRAG:
         else:
             current_graph_nodes = set()
 
-        logger.info(f"Adding OpenIE triples to graph.")
+        logger.info(f"将OpenIE三元组添加到图中.")
 
         for chunk_key, triples in tqdm(zip(chunk_ids, chunk_triples)):
             entities_in_chunk = set()
@@ -819,7 +1157,7 @@ class HippoRAG:
 
         num_new_chunks = 0
 
-        logger.info(f"Connecting passage nodes to phrase nodes.")
+        logger.info(f"连接段落节点到短语节点.")
 
         for idx, chunk_key in tqdm(enumerate(chunk_ids)):
 
@@ -850,12 +1188,12 @@ class HippoRAG:
             node_to_node_stats: dict. Stores scores for edges between nodes representing their relationship.
 
         """
-        logger.info(f"Expanding graph with synonymy edges")
+        logger.info(f"使用同义词边扩展图")
 
         self.entity_id_to_row = self.entity_embedding_store.get_all_id_to_rows()
         entity_node_keys = list(self.entity_id_to_row.keys())
 
-        logger.info(f"Performing KNN retrieval for each phrase nodes ({len(entity_node_keys)}).")
+        logger.info(f"对每个短语节点执行KNN检索 ({len(entity_node_keys)}).")
 
         entity_embs = self.entity_embedding_store.get_embeddings(entity_node_keys)
 
@@ -1019,7 +1357,7 @@ class HippoRAG:
             
             with open(self.openie_results_path, 'w') as f:
                 json.dump(openie_dict, f)
-            logger.info(f"OpenIE results saved to {self.openie_results_path}")
+            logger.info(f"OpenIE结果已保存到 {self.openie_results_path}")
 
     def augment_graph(self):
         """
@@ -1031,7 +1369,7 @@ class HippoRAG:
         self.add_new_nodes()
         self.add_new_edges()
 
-        logger.info(f"Graph construction completed!")
+        logger.info(f"图构建完成!")
         print(self.get_graph_info())
 
     def add_new_nodes(self):
@@ -1152,20 +1490,93 @@ class HippoRAG:
         if qa_metrics is not None:
             run_entry["qa_metrics"] = qa_metrics
 
+        # 去重：检查是否与最后一次运行的结果相同（且source和模型相同）
+        if runs:
+            last_run = runs[-1]
+            # 检查source是否相同
+            if last_run.get("source") == run_entry.get("source"):
+                # 检查模型是否相同（使用模糊匹配）
+                from .llm import _extract_model_keywords
+                last_llm_keywords = _extract_model_keywords(last_run.get("llm_name", ""))
+                current_llm_keywords = _extract_model_keywords(run_entry.get("llm_name", ""))
+                models_match = (last_llm_keywords == current_llm_keywords) if last_llm_keywords and current_llm_keywords else (last_run.get("llm_name") == run_entry.get("llm_name"))
+
+                if models_match:
+                    # 比较metrics内容（忽略timestamp）
+                    is_duplicate = True
+                    for key in ["retrieval_metrics", "qa_metrics", "retrieval_mode_counts"]:
+                        if run_entry.get(key) != last_run.get(key):
+                            is_duplicate = False
+                            break
+
+                    if is_duplicate:
+                        logger.info(f"指标与上次运行相同，跳过保存以避免重复")
+                        return
+
         runs.append(run_entry)
         evaluation_payload = dict(existing_payload)
         evaluation_payload["runs"] = runs
 
-        with open(metrics_file_path, 'w') as f:
-            json.dump(evaluation_payload, f, indent=2)
-        logger.info(f"Evaluation metrics saved to {metrics_file_path}")
+        # 自定义JSON格式化：在retrieval和qa之间加小间隔，不同运行之间加大间隔
+        with open(metrics_file_path, 'w', encoding='utf-8') as f:
+            f.write("{\n")
+
+            # 写入其他字段（如果有）
+            other_keys = [k for k in evaluation_payload.keys() if k != "runs"]
+            for i, key in enumerate(other_keys):
+                f.write(f'  "{key}": {json.dumps(evaluation_payload[key], ensure_ascii=False)}')
+                if i < len(other_keys) - 1 or "runs" in evaluation_payload:
+                    f.write(",")
+                f.write("\n")
+
+            # 写入runs数组
+            f.write('  "runs": [\n')
+            for run_idx, run in enumerate(runs):
+                f.write("    {\n")
+
+                # 写入基本信息
+                basic_keys = ["timestamp", "llm_name", "embedding_model_name", "dataset", "source"]
+                for key in basic_keys:
+                    if key in run:
+                        f.write(f'      "{key}": {json.dumps(run[key], ensure_ascii=False)},\n')
+
+                # 写入retrieval_mode_counts（如果有）
+                if "retrieval_mode_counts" in run:
+                    f.write(f'      "retrieval_mode_counts": {json.dumps(run["retrieval_mode_counts"], ensure_ascii=False)},\n')
+
+                # 写入retrieval_metrics（如果有）
+                if "retrieval_metrics" in run:
+                    f.write('      "retrieval_metrics": ')
+                    f.write(json.dumps(run["retrieval_metrics"], ensure_ascii=False))
+                    if "qa_metrics" in run:
+                        f.write(',\n\n')  # 小间隔：retrieval和qa之间
+                    else:
+                        f.write('\n')
+
+                # 写入qa_metrics（如果有）
+                if "qa_metrics" in run:
+                    f.write('      "qa_metrics": ')
+                    f.write(json.dumps(run["qa_metrics"], ensure_ascii=False))
+                    f.write('\n')
+
+                # 结束当前run
+                f.write("    }")
+                if run_idx < len(runs) - 1:
+                    f.write(",\n\n\n")  # 大间隔：不同运行之间（3个换行）
+                else:
+                    f.write("\n")
+
+            f.write("  ]\n")
+            f.write("}\n")
+
+        logger.info(f"评估指标已保存到 {metrics_file_path}")
 
     def save_igraph(self):
         logger.info(
-            f"Writing graph with {len(self.graph.vs())} nodes, {len(self.graph.es())} edges"
+            f"写入图，包含 {len(self.graph.vs())} 个节点，{len(self.graph.es())} 条边"
         )
         self.graph.write_pickle(self._graph_pickle_filename)
-        logger.info(f"Saving graph completed!")
+        logger.info(f"图保存完成!")
 
     def get_graph_info(self) -> Dict:
         """
@@ -1228,9 +1639,9 @@ class HippoRAG:
         and alignment with the underlying graph structure.
         """
 
-        logger.info("Preparing for fast retrieval.")
+        logger.info("准备快速检索")
 
-        logger.info("Loading keys.")
+        logger.info("加载键")
         self.query_to_embedding: Dict = {'triple': {}, 'passage': {}}
 
         self.entity_node_keys: List = list(self.entity_embedding_store.get_all_ids()) # a list of phrase node keys
@@ -1276,7 +1687,7 @@ class HippoRAG:
             self.entity_node_idxs = []
             self.passage_node_idxs = []
 
-        logger.info("Loading embeddings.")
+        logger.info("加载嵌入")
         self.entity_embeddings = np.array(self.entity_embedding_store.get_embeddings(self.entity_node_keys))
         self.passage_embeddings = np.array(self.chunk_embedding_store.get_embeddings(self.passage_node_keys))
 
@@ -1348,14 +1759,14 @@ class HippoRAG:
 
         if len(all_query_strings) > 0:
             # get all query embeddings
-            logger.info(f"Encoding {len(all_query_strings)} queries for query_to_fact.")
+            logger.info(f"为 {len(all_query_strings)} 个查询编码 query_to_fact")
             query_embeddings_for_triple = self.embedding_model.batch_encode(all_query_strings,
                                                                             instruction=get_query_instruction('query_to_fact'),
                                                                             norm=True)
             for query, embedding in zip(all_query_strings, query_embeddings_for_triple):
                 self.query_to_embedding['triple'][query] = embedding
 
-            logger.info(f"Encoding {len(all_query_strings)} queries for query_to_passage.")
+            logger.info(f"为 {len(all_query_strings)} 个查询编码 query_to_passage")
             query_embeddings_for_passage = self.embedding_model.batch_encode(all_query_strings,
                                                                              instruction=get_query_instruction('query_to_passage'),
                                                                              norm=True)
