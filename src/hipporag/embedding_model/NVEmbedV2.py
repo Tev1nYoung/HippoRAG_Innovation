@@ -95,6 +95,15 @@ class NVEmbedV2EmbeddingModel(BaseEmbeddingModel):
         logger.debug(f"Init {self.__class__.__name__}'s embedding_config (quantization={use_quantization})")
 
     def batch_encode(self, texts: List[str], **kwargs) -> None:
+        """
+        动态调节batch size的编码函数
+
+        逻辑：
+        - 初始batch_size=4
+        - 每成功处理100条记录，batch_size+1（最大12）
+        - 发生OOM时，batch_size降为当前值的一半（最小1）
+        - 只有连续5次batch_size=1时都OOM才结束程序
+        """
         if isinstance(texts, str): texts = [texts]
 
         params = deepcopy(self.embedding_config.encode_params)
@@ -104,26 +113,101 @@ class NVEmbedV2EmbeddingModel(BaseEmbeddingModel):
             if kwargs["instruction"] != '':
                 params["instruction"] = f"Instruct: {kwargs['instruction']}\nQuery: "
 
-        batch_size = params.pop("batch_size", 16)
+        # 移除原始batch_size参数，使用动态调节
+        params.pop("batch_size", None)
 
-        logger.debug(f"Calling {self.__class__.__name__} with batch_size={batch_size}")
-        if len(texts) <= batch_size:
-            params["prompts"] = texts
-            results = self.embedding_model.encode(**params)
-        else:
-            pbar = tqdm(total=len(texts), desc="Batch Encoding")
-            results = []
-            for i in range(0, len(texts), batch_size):
-                params["prompts"] = texts[i:i + batch_size]
-                results.append(self.embedding_model.encode(**params))
-                pbar.update(batch_size)
-            pbar.close()
+        # 动态batch size参数
+        current_batch_size = 4  # 初始batch size
+        max_batch_size = 12  # 最大batch size
+        min_batch_size = 1  # 最小batch size
+        success_count = 0  # 成功处理的记录数
+        increase_threshold = 100  # 每处理100条增加batch size
+        oom_count_at_min = 0  # 在batch_size=1时连续OOM的次数
+        max_oom_retries = 5  # 最大连续OOM重试次数
+
+        logger.info(f"开始动态batch size编码，初始batch_size={current_batch_size}，最大={max_batch_size}")
+
+        pbar = tqdm(total=len(texts), desc="Batch Encoding")
+        results = []
+        i = 0
+
+        while i < len(texts):
+            # 确定当前批次大小
+            actual_batch_size = min(current_batch_size, len(texts) - i)
+            params["prompts"] = texts[i:i + actual_batch_size]
+
+            try:
+                # 清理GPU缓存
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+
+                # 编码当前批次
+                batch_result = self.embedding_model.encode(**params)
+                results.append(batch_result)
+
+                # 成功处理，重置OOM计数器
+                oom_count_at_min = 0
+
+                # 更新进度
+                i += actual_batch_size
+                success_count += actual_batch_size
+                pbar.update(actual_batch_size)
+
+                # 每成功处理100条，增加batch size
+                if success_count >= increase_threshold and current_batch_size < max_batch_size:
+                    current_batch_size += 1
+                    success_count = 0  # 重置计数器
+                    logger.info(f"✓ 成功处理100条记录，增加batch_size到 {current_batch_size}")
+
+            except RuntimeError as e:
+                if "out of memory" in str(e).lower() or "cuda" in str(e).lower():
+                    # OOM错误处理
+                    if current_batch_size == min_batch_size:
+                        # 已经是最小batch size
+                        oom_count_at_min += 1
+                        logger.warning(f"✗ batch_size={min_batch_size} OOM (第{oom_count_at_min}/{max_oom_retries}次)")
+
+                        if oom_count_at_min >= max_oom_retries:
+                            # 连续5次OOM，无法继续
+                            logger.error(f"✗ batch_size={min_batch_size} 连续{max_oom_retries}次OOM，无法继续处理")
+                            pbar.close()
+                            raise RuntimeError(f"batch_size={min_batch_size}连续{max_oom_retries}次OOM，程序终止")
+
+                        # 清理GPU缓存后重试
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                        # 不增加i，重试当前位置
+                    else:
+                        # 降低batch size
+                        old_batch_size = current_batch_size
+                        current_batch_size = max(min_batch_size, current_batch_size // 2)
+                        success_count = 0  # 重置计数器
+                        oom_count_at_min = 0  # 重置OOM计数器（因为不是在min_batch_size）
+                        logger.warning(f"✗ 检测到OOM，降低batch_size: {old_batch_size} → {current_batch_size}")
+
+                        # 清理GPU缓存
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+
+                        # 不增加i，重试当前位置
+                else:
+                    # 其他错误，直接抛出
+                    pbar.close()
+                    raise
+
+        pbar.close()
+
+        # 合并所有结果
+        if results:
             results = torch.cat(results, dim=0)
 
-        if isinstance(results, torch.Tensor):
-            results = results.cpu()
-            results = results.numpy()
-        if self.embedding_config.norm:
-            results = (results.T / np.linalg.norm(results, axis=1)).T
+            if isinstance(results, torch.Tensor):
+                results = results.cpu()
+                results = results.numpy()
+            if self.embedding_config.norm:
+                results = (results.T / np.linalg.norm(results, axis=1)).T
 
-        return results
+            logger.info(f"✓ 编码完成，共处理 {len(texts)} 条记录")
+            return results
+        else:
+            raise RuntimeError("没有成功编码任何数据")

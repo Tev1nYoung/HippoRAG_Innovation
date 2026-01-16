@@ -92,10 +92,15 @@ class EmbeddingStore:
             chunk_ids = missing_ids[i:i + chunk_size]
 
             logger.info(f"编码批次 {i//chunk_size + 1}/{(len(texts_to_encode) + chunk_size - 1)//chunk_size} ({len(chunk_texts)} 条记录)")
-            chunk_embeddings = self.embedding_model.batch_encode(chunk_texts)
 
-            # 立即保存这一批
-            self._upsert(chunk_ids, chunk_texts, chunk_embeddings)
+            try:
+                chunk_embeddings = self.embedding_model.batch_encode(chunk_texts)
+                # 立即保存这一批
+                self._upsert(chunk_ids, chunk_texts, chunk_embeddings)
+            except Exception as e:
+                logger.error(f"编码批次 {i//chunk_size + 1} 失败: {str(e)}")
+                logger.info(f"已成功保存前 {i} 条记录，可以从此处继续")
+                raise
 
     def _load_data(self):
         if os.path.exists(self.filename):
