@@ -129,7 +129,7 @@ def main():
         qa_num_workers=3,  # QA并发数设置为6
         retrieval_num_workers=3,  # Retrieval并发数设置为6
         graph_type="facts_and_sim_passage_node_unidirectional",
-        embedding_batch_size=2, 
+        embedding_batch_size=4, 
         max_new_tokens=None,
         corpus_len=len(corpus),
         openie_mode=args.openie_mode,

@@ -75,21 +75,47 @@ class EmbeddingStore:
                 return  # 成功完成
             except RuntimeError as e:
                 if "连续5次OOM" in str(e) and "需要重新执行" in str(e):
-                    # 5连续OOM时，先保存已完成的数据防止丢失
-                    logger.warning("⚠️ 检测到5连续OOM，立即保存已完成的数据...")
+                    # 5连续OOM时，先保存当前内存中已完成的数据防止丢失
+                    logger.warning(f"⚠️ 检测到5连续OOM，立即保存已完成的数据（共{len(self.hash_ids)}条）...")
                     self._save_data()
-                    logger.info("✓ 已完成的数据已保存到缓存")
+                    logger.info(f"✓ 已完成的{len(self.hash_ids)}条数据已保存到缓存")
+
+                    # 经验：同一进程内的CUDA/bitsandbytes状态很难彻底恢复；最稳妥是直接重启进程断点续跑。
+                    import os
+                    import sys
 
                     retry_count += 1
                     if retry_count > max_retries:
                         logger.error(f"已重试{max_retries}次，仍然失败，程序终止")
                         raise
-                    logger.warning(f"准备第{retry_count}次重新执行整个insert_strings流程...")
-                    # 清理一些状态，重新开始
-                    import time
-                    time.sleep(10)  # 等待10秒让GPU充分释放
-                    # 重新加载数据
-                    self._load_data()
+
+                    restart_enabled = os.getenv("HIPPORAG_OOM_RESTART", "1").lower() not in ("0", "false", "no")
+                    if not restart_enabled:
+                        logger.error("自动重启已禁用（设置 HIPPORAG_OOM_RESTART=0），请手动重新执行程序")
+                        raise
+
+                    try:
+                        max_restarts = int(os.getenv("HIPPORAG_OOM_RESTART_MAX", "3"))
+                    except Exception:
+                        max_restarts = 3
+
+                    try:
+                        restart_count = int(os.getenv("HIPPORAG_OOM_RESTART_COUNT", "0"))
+                    except Exception:
+                        restart_count = 0
+
+                    if restart_count >= max_restarts:
+                        logger.error(f"已达到最大自动重启次数 {restart_count}/{max_restarts}，请手动重新执行程序")
+                        raise
+
+                    os.environ["HIPPORAG_OOM_RESTART_COUNT"] = str(restart_count + 1)
+                    logger.error(f"准备自动重启进程以清空CUDA/bnb状态 ({restart_count + 1}/{max_restarts})...")
+                    try:
+                        sys.stdout.flush()
+                        sys.stderr.flush()
+                    except Exception:
+                        pass
+                    os.execv(sys.executable, [sys.executable] + sys.argv)
                 else:
                     raise
 
@@ -121,7 +147,7 @@ class EmbeddingStore:
         # Prepare the texts to encode from the "content" field.
         texts_to_encode = [nodes_dict[hash_id]["content"] for hash_id in missing_ids]
 
-        # 分批编码和保存，每1000条保存一次，支持断点续传
+        # 分批编码和保存，每1000条保存一次，支持断点续传（减小chunk_size以降低GPU内存压力）
         chunk_size = 1000
         for i in range(0, len(texts_to_encode), chunk_size):
             chunk_texts = texts_to_encode[i:i + chunk_size]
@@ -133,8 +159,48 @@ class EmbeddingStore:
                 chunk_embeddings = self.embedding_model.batch_encode(chunk_texts)
                 # 立即保存这一批
                 self._upsert(chunk_ids, chunk_texts, chunk_embeddings)
+                # 可选：每个chunk后做一次CUDA清理，降低碎片化/后续chunk突然OOM的概率
+                import os
+                if os.getenv("HIPPORAG_EMBED_CHUNK_CUDA_CLEANUP", "1").lower() not in ("0", "false", "no"):
+                    try:
+                        import gc
+                        import torch
+                        import time
+                        for _ in range(3):
+                            gc.collect()
+                        if torch.cuda.is_available():
+                            try:
+                                torch.cuda.synchronize()
+                            except Exception:
+                                pass
+                            torch.cuda.empty_cache()
+                            if hasattr(torch.cuda, "ipc_collect"):
+                                torch.cuda.ipc_collect()
+                            try:
+                                torch.cuda.synchronize()
+                            except Exception:
+                                pass
+                        # 给驱动一点时间回收/整理（避免下一个chunk开头free=0）
+                        time.sleep(float(os.getenv("HIPPORAG_EMBED_CHUNK_CUDA_SLEEP", "0.2")))
+                    except Exception:
+                        pass
             except RuntimeError as e:
                 if "连续5次OOM" in str(e) and "需要重新执行" in str(e):
+                    # OOM失败，检查是否有已编码的部分数据
+                    if hasattr(e, 'partial_results') and e.partial_results is not None:
+                        # 有部分编码结果，保存这部分（支持乱序/非前缀）
+                        partial_count = len(e.partial_results)
+                        logger.warning(f"⚠️ OOM时有{partial_count}条已编码数据，立即保存...")
+
+                        if hasattr(e, "partial_indices") and e.partial_indices:
+                            partial_ids = [chunk_ids[i] for i in e.partial_indices]
+                            partial_texts = [chunk_texts[i] for i in e.partial_indices]
+                        else:
+                            partial_ids = chunk_ids[:partial_count]
+                            partial_texts = chunk_texts[:partial_count]
+
+                        self._upsert(partial_ids, partial_texts, e.partial_results)
+                        logger.info(f"✓ 已保存{partial_count}条部分编码数据")
                     # OOM失败，重新抛出给上层的insert_strings处理
                     raise
                 else:
