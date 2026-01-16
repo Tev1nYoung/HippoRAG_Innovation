@@ -75,11 +75,16 @@ class EmbeddingStore:
                 return  # 成功完成
             except RuntimeError as e:
                 if "连续5次OOM" in str(e) and "需要重新执行" in str(e):
+                    # 5连续OOM时，先保存已完成的数据防止丢失
+                    logger.warning("⚠️ 检测到5连续OOM，立即保存已完成的数据...")
+                    self._save_data()
+                    logger.info("✓ 已完成的数据已保存到缓存")
+
                     retry_count += 1
                     if retry_count > max_retries:
                         logger.error(f"已重试{max_retries}次，仍然失败，程序终止")
                         raise
-                    logger.warning(f"检测到OOM失败，准备第{retry_count}次重新执行整个insert_strings流程...")
+                    logger.warning(f"准备第{retry_count}次重新执行整个insert_strings流程...")
                     # 清理一些状态，重新开始
                     import time
                     time.sleep(10)  # 等待10秒让GPU充分释放
