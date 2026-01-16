@@ -1,5 +1,6 @@
 from copy import deepcopy
 from typing import List, Optional
+import time
 
 import numpy as np
 import torch
@@ -202,20 +203,39 @@ class NVEmbedV2EmbeddingModel(BaseEmbeddingModel):
 
                     # 第三步：降低batch size
                     if current_batch_size == min_batch_size:
-                        # 已经是最小batch size
+                        # 已经是最小batch size，进行深度清理
                         oom_count_at_min += 1
                         logger.warning(f"✗ batch_size={min_batch_size} OOM (第{oom_count_at_min}/{max_oom_retries}次)")
 
                         if oom_count_at_min >= max_oom_retries:
-                            # 连续5次OOM，无法继续
-                            logger.error(f"✗ batch_size={min_batch_size} 连续{max_oom_retries}次OOM，无法继续处理")
-                            pbar.close()
-                            raise RuntimeError(f"batch_size={min_batch_size}连续{max_oom_retries}次OOM，程序终止")
+                            # 连续5次OOM，进行最后的深度清理尝试
+                            logger.warning(f"⚠ 连续{max_oom_retries}次OOM，执行深度清理...")
 
-                        # 清理GPU缓存后重试
-                        if torch.cuda.is_available():
-                            torch.cuda.empty_cache()
-                        # 不增加i，重试当前位置
+                            # 深度清理GPU
+                            if torch.cuda.is_available():
+                                torch.cuda.empty_cache()
+                                torch.cuda.synchronize()
+                                torch.cuda.ipc_collect()  # 清理IPC缓存
+
+                            # 等待GPU完全释放
+                            logger.info("等待5秒让GPU完全释放...")
+                            time.sleep(5)
+
+                            # 重置OOM计数器，再给5次机会
+                            oom_count_at_min = 0
+                            logger.info(f"✓ 深度清理完成，重置计数器，继续尝试...")
+                            # 不增加i，重试当前位置
+                        else:
+                            # 清理GPU缓存并等待
+                            if torch.cuda.is_available():
+                                torch.cuda.empty_cache()
+                                torch.cuda.synchronize()
+
+                            # 根据OOM次数增加等待时间
+                            wait_time = oom_count_at_min * 2  # 2秒、4秒、6秒...
+                            logger.info(f"等待{wait_time}秒后重试...")
+                            time.sleep(wait_time)
+                            # 不增加i，重试当前位置
                     else:
                         # 降低batch size（每次减1而不是减半）
                         old_batch_size = current_batch_size
