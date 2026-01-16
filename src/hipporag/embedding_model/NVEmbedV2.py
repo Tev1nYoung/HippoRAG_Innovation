@@ -101,7 +101,7 @@ class NVEmbedV2EmbeddingModel(BaseEmbeddingModel):
         逻辑：
         - 初始batch_size=4
         - 每成功处理100条记录，batch_size+1（最大12）
-        - 发生OOM时，batch_size降为当前值的一半（最小1）
+        - 发生OOM时，先清理GPU碎片，再降低batch_size为当前值的一半（最小1）
         - 只有连续5次batch_size=1时都OOM才结束程序
         """
         if isinstance(texts, str): texts = [texts]
@@ -161,7 +161,46 @@ class NVEmbedV2EmbeddingModel(BaseEmbeddingModel):
 
             except RuntimeError as e:
                 if "out of memory" in str(e).lower() or "cuda" in str(e).lower():
-                    # OOM错误处理
+                    # OOM错误处理：先清理碎片，再降低batch size
+                    logger.warning(f"✗ 检测到OOM，开始清理GPU碎片...")
+
+                    # 第一步：清理GPU碎片
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                        torch.cuda.synchronize()  # 同步GPU操作
+
+                    # 第二步：尝试用当前batch size重试（清理碎片后可能成功）
+                    try:
+                        logger.info(f"尝试用当前batch_size={current_batch_size}重新处理...")
+                        batch_result = self.embedding_model.encode(**params)
+                        results.append(batch_result)
+
+                        # 成功处理，重置OOM计数器
+                        oom_count_at_min = 0
+
+                        # 更新进度
+                        i += actual_batch_size
+                        success_count += actual_batch_size
+                        pbar.update(actual_batch_size)
+
+                        # 每成功处理100条，增加batch size
+                        if success_count >= increase_threshold and current_batch_size < max_batch_size:
+                            current_batch_size += 1
+                            success_count = 0
+                            logger.info(f"✓ 成功处理100条记录，增加batch_size到 {current_batch_size}")
+
+                        logger.info(f"✓ 清理碎片后成功处理，继续使用batch_size={current_batch_size}")
+                        continue
+
+                    except RuntimeError as retry_e:
+                        if "out of memory" not in str(retry_e).lower() and "cuda" not in str(retry_e).lower():
+                            pbar.close()
+                            raise
+
+                        # 清理碎片后仍然OOM，降低batch size
+                        logger.warning(f"清理碎片后仍然OOM，开始降低batch_size...")
+
+                    # 第三步：降低batch size
                     if current_batch_size == min_batch_size:
                         # 已经是最小batch size
                         oom_count_at_min += 1
@@ -178,9 +217,9 @@ class NVEmbedV2EmbeddingModel(BaseEmbeddingModel):
                             torch.cuda.empty_cache()
                         # 不增加i，重试当前位置
                     else:
-                        # 降低batch size
+                        # 降低batch size（每次减1而不是减半）
                         old_batch_size = current_batch_size
-                        current_batch_size = max(min_batch_size, current_batch_size // 2)
+                        current_batch_size = max(min_batch_size, current_batch_size - 1)
                         success_count = 0  # 重置计数器
                         oom_count_at_min = 0  # 重置OOM计数器（因为不是在min_batch_size）
                         logger.warning(f"✗ 检测到OOM，降低batch_size: {old_batch_size} → {current_batch_size}")
