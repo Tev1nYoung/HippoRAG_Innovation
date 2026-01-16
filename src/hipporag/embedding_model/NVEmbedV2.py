@@ -208,23 +208,11 @@ class NVEmbedV2EmbeddingModel(BaseEmbeddingModel):
                         logger.warning(f"✗ batch_size={min_batch_size} OOM (第{oom_count_at_min}/{max_oom_retries}次)")
 
                         if oom_count_at_min >= max_oom_retries:
-                            # 连续5次OOM，进行最后的深度清理尝试
-                            logger.warning(f"⚠ 连续{max_oom_retries}次OOM，执行深度清理...")
+                            # 连续5次OOM，抛出异常让上层重试
+                            logger.warning(f"⚠ batch_size={min_batch_size}连续{max_oom_retries}次OOM，抛出异常要求重新执行")
+                            pbar.close()
+                            raise RuntimeError(f"batch_size={min_batch_size}连续{max_oom_retries}次OOM，需要重新执行")
 
-                            # 深度清理GPU
-                            if torch.cuda.is_available():
-                                torch.cuda.empty_cache()
-                                torch.cuda.synchronize()
-                                torch.cuda.ipc_collect()  # 清理IPC缓存
-
-                            # 等待GPU完全释放
-                            logger.info("等待5秒让GPU完全释放...")
-                            time.sleep(5)
-
-                            # 重置OOM计数器，再给5次机会
-                            oom_count_at_min = 0
-                            logger.info(f"✓ 深度清理完成，重置计数器，继续尝试...")
-                            # 不增加i，重试当前位置
                         else:
                             # 清理GPU缓存并等待
                             if torch.cuda.is_available():

@@ -61,6 +61,37 @@ class EmbeddingStore:
         return {h: {"hash_id": h, "content": t} for h, t in zip(missing_ids, texts_to_encode)}
 
     def insert_strings(self, texts: List[str]):
+        """
+        插入文本字符串并编码为embeddings
+
+        当OOM导致需要重新执行时，会自动重试整个流程
+        """
+        max_retries = 3  # 最多重试3次整个流程
+        retry_count = 0
+
+        while retry_count <= max_retries:
+            try:
+                self._insert_strings_impl(texts)
+                return  # 成功完成
+            except RuntimeError as e:
+                if "连续5次OOM" in str(e) and "需要重新执行" in str(e):
+                    retry_count += 1
+                    if retry_count > max_retries:
+                        logger.error(f"已重试{max_retries}次，仍然失败，程序终止")
+                        raise
+                    logger.warning(f"检测到OOM失败，准备第{retry_count}次重新执行整个insert_strings流程...")
+                    # 清理一些状态，重新开始
+                    import time
+                    time.sleep(10)  # 等待10秒让GPU充分释放
+                    # 重新加载数据
+                    self._load_data()
+                else:
+                    raise
+
+    def _insert_strings_impl(self, texts: List[str]):
+        """
+        实际的插入实现逻辑
+        """
         nodes_dict = {}
 
         for text in texts:
@@ -97,10 +128,14 @@ class EmbeddingStore:
                 chunk_embeddings = self.embedding_model.batch_encode(chunk_texts)
                 # 立即保存这一批
                 self._upsert(chunk_ids, chunk_texts, chunk_embeddings)
-            except Exception as e:
-                logger.error(f"编码批次 {i//chunk_size + 1} 失败: {str(e)}")
-                logger.info(f"已成功保存前 {i} 条记录，可以从此处继续")
-                raise
+            except RuntimeError as e:
+                if "连续5次OOM" in str(e) and "需要重新执行" in str(e):
+                    # OOM失败，重新抛出给上层的insert_strings处理
+                    raise
+                else:
+                    logger.error(f"编码批次 {i//chunk_size + 1} 失败: {str(e)}")
+                    logger.info(f"已成功保存前 {i} 条记录，可以从此处继续")
+                    raise
 
     def _load_data(self):
         if os.path.exists(self.filename):
