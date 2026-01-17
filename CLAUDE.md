@@ -113,7 +113,7 @@ python tests_third_party_api.py \
 ### OpenAI官方API测试
 ```bash
 export OPENAI_API_KEY=<your openai api key>
-python tests_openai.py
+python examples/tests_openai.py
 ```
 
 ### 本地vLLM测试（需要GPU资源）
@@ -124,7 +124,7 @@ export VLLM_WORKER_MULTIPROC_METHOD=spawn
 vllm serve meta-llama/Llama-3.1-8B-Instruct --max_model_len 4096 --gpu-memory-utilization 0.95 --port 6578
 
 # 终端2: 运行测试
-CUDA_VISIBLE_DEVICES=1 python tests_local.py
+CUDA_VISIBLE_DEVICES=1 python examples/tests_local.py
 ```
 
 ## 运行实验

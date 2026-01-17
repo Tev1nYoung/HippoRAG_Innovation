@@ -1,8 +1,14 @@
 import os
+import sys
 from typing import List
 import json
 import argparse
 import logging
+
+# 兼容从仓库根目录执行：python examples/tests_openai.py
+_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
 
 from src.hipporag import HippoRAG
 
@@ -19,20 +25,16 @@ def main():
         "Erik Hort's birthplace is Montebello.",
         "Marina is bom in Minsk.",
         "Montebello is a part of Rockland County."
-        "Montebello is a part of Rockland County.."
     ]
 
-    save_dir = 'outputs/azure'  # Define save directory for HippoRAG objects (each LLM/Embedding model combination will create a new subdirectory)
+    save_dir = 'outputs/openai_test'  # Define save directory for HippoRAG objects (each LLM/Embedding model combination will create a new subdirectory)
     llm_model_name = 'gpt-4o-mini'  # Any OpenAI model name
     embedding_model_name = 'text-embedding-3-small'  # Embedding model name (NV-Embed, GritLM or Contriever for now)
 
     # Startup a HippoRAG instance
     hipporag = HippoRAG(save_dir=save_dir,
                         llm_model_name=llm_model_name,
-                        embedding_model_name=embedding_model_name,
-                        azure_endpoint="https://[ENDPOINT NAME].openai.azure.com/openai/deployments/gpt-4o-mini/chat/completions?api-version=2025-01-01-preview",
-                        azure_embedding_endpoint="https://[ENDPOINT NAME].openai.azure.com/openai/deployments/text-embedding-3-small/embeddings?api-version=2023-05-15"
-                        )
+                        embedding_model_name=embedding_model_name)
 
     # Run indexing
     hipporag.index(docs=docs)
@@ -62,14 +64,49 @@ def main():
 
     print(hipporag.rag_qa(queries=queries,
                                   gold_docs=gold_docs,
-                                  gold_answers=answers))
+                                  gold_answers=answers)[-2:])
+
+    # Startup a HippoRAG instance
+    hipporag = HippoRAG(save_dir=save_dir,
+                        llm_model_name=llm_model_name,
+                        embedding_model_name=embedding_model_name)
+
+    print(hipporag.rag_qa(queries=queries,
+                                  gold_docs=gold_docs,
+                                  gold_answers=answers)[-2:])
+
+    # Startup a HippoRAG instance
+    hipporag = HippoRAG(save_dir=save_dir,
+                        llm_model_name=llm_model_name,
+                        embedding_model_name=embedding_model_name)
+
+    new_docs = [
+        "Tom Hort's birthplace is Montebello.",
+        "Sam Hort's birthplace is Montebello.",
+        "Bill Hort's birthplace is Montebello.",
+        "Cam Hort's birthplace is Montebello.",
+        "Montebello is a part of Rockland County.."]
+
+    # Run indexing
+    hipporag.index(docs=new_docs)
+
+    print(hipporag.rag_qa(queries=queries,
+                          gold_docs=gold_docs,
+                          gold_answers=answers)[-2:])
 
     docs_to_delete = [
-        "Erik Hort's birthplace is Montebello.",
+        "Tom Hort's birthplace is Montebello.",
+        "Sam Hort's birthplace is Montebello.",
+        "Bill Hort's birthplace is Montebello.",
+        "Cam Hort's birthplace is Montebello.",
         "Montebello is a part of Rockland County.."
     ]
 
     hipporag.delete(docs_to_delete)
+
+    print(hipporag.rag_qa(queries=queries,
+                          gold_docs=gold_docs,
+                          gold_answers=answers)[-2:])
 
 if __name__ == "__main__":
     main()

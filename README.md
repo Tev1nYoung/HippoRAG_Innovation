@@ -184,7 +184,7 @@ export OPENAI_API_KEY=<your openai api key>
 
 conda activate hipporag
 
-python tests_openai.py
+python examples/tests_openai.py
 ```
 
 ### Local Test
@@ -205,7 +205,7 @@ vllm serve meta-llama/Llama-3.1-8B-Instruct --tensor-parallel-size 2 --max_model
 Then, we run the following test script:
 
 ```sh
-CUDA_VISIBLE=1 python tests_local.py
+CUDA_VISIBLE=1 python examples/tests_local.py
 ```
 
 ## Reproducing our Experiments

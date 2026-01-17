@@ -1,17 +1,18 @@
 import os
+import sys
 from typing import List
 import json
 import argparse
 import logging
 
-from src.hipporag import HippoRAG
-from src.hipporag.utils.config_utils import BaseConfig
+# 兼容从仓库根目录执行：python examples/demo_azure.py
+_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
 
-logging.basicConfig(level=logging.DEBUG)
+from src.hipporag import HippoRAG
 
 def main():
-
-
 
     # Prepare datasets and evaluation
     docs = [
@@ -24,22 +25,19 @@ def main():
         "Erik Hort's birthplace is Montebello.",
         "Marina is bom in Minsk.",
         "Montebello is a part of Rockland County."
+        "Montebello is a part of Rockland County.."
     ]
 
-    save_dir = 'outputs/local_test'  # Define save directory for HippoRAG objects (each LLM/Embedding model combination will create a new subdirectory)
-    llm_model_name = 'Transformers/Qwen/Qwen2.5-7B-Instruct'  # Any OpenAI model name
-    embedding_model_name = 'Transformers/BAAI/bge-m3'  # Embedding model name (NV-Embed, GritLM or Contriever for now)
-
-    global_config = BaseConfig(
-        openie_mode='Transformers-offline',
-        information_extraction_model_name='Transformers/Qwen/Qwen2.5-7B-Instruct'
-    )
+    save_dir = 'outputs/azure'  # Define save directory for HippoRAG objects (each LLM/Embedding model combination will create a new subdirectory)
+    llm_model_name = 'gpt-4o-mini'  # Any OpenAI model name
+    embedding_model_name = 'text-embedding-3-small'  # Embedding model name (NV-Embed, GritLM or Contriever for now)
 
     # Startup a HippoRAG instance
-    hipporag = HippoRAG(global_config,
-                        save_dir=save_dir,
+    hipporag = HippoRAG(save_dir=save_dir,
                         llm_model_name=llm_model_name,
                         embedding_model_name=embedding_model_name,
+                        azure_endpoint="https://[ENDPOINT NAME].openai.azure.com/openai/deployments/gpt-4o-mini/chat/completions?api-version=2025-01-01-preview",
+                        azure_embedding_endpoint="https://[ENDPOINT NAME].openai.azure.com/openai/deployments/text-embedding-3-small/embeddings?api-version=2023-05-15"
                         )
 
     # Run indexing
@@ -70,7 +68,14 @@ def main():
 
     print(hipporag.rag_qa(queries=queries,
                                   gold_docs=gold_docs,
-                                  gold_answers=answers)[-2:])
+                                  gold_answers=answers))
+
+    docs_to_delete = [
+        "Erik Hort's birthplace is Montebello.",
+        "Montebello is a part of Rockland County.."
+    ]
+
+    hipporag.delete(docs_to_delete)
 
 if __name__ == "__main__":
     main()

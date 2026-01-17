@@ -1,19 +1,18 @@
 import os
+import sys
 from typing import List
 import json
 import argparse
 import logging
 
+# 兼容从仓库根目录执行：python examples/tests_local.py
+_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
+
 from src.hipporag import HippoRAG
 
 def main():
-    parser = argparse.ArgumentParser(description="Testing HippoRAG")
-    parser.add_argument('--azure_endpoint', type=str, default=None, help='Azure Endpoint URL')
-    parser.add_argument('--azure_embedding_endpoint', type=str, default=None, help='Azure Embedding Endpoint')
-    args = parser.parse_args()
-
-    azure_endpoint = args.azure_endpoint
-    azure_embedding_endpoint = args.azure_embedding_endpoint
 
     # Prepare datasets and evaluation
     docs = [
@@ -28,16 +27,15 @@ def main():
         "Montebello is a part of Rockland County."
     ]
 
-    save_dir = 'outputs/azure_test'  # Define save directory for HippoRAG objects (each LLM/Embedding model combination will create a new subdirectory)
-    llm_model_name = 'gpt-4o-mini'  # Any OpenAI model name
-    embedding_model_name = 'text-embedding-3-small'  # Embedding model name (NV-Embed, GritLM or Contriever for now)
+    save_dir = 'outputs/local_test'  # Define save directory for HippoRAG objects (each LLM/Embedding model combination will create a new subdirectory)
+    llm_model_name = 'meta-llama/Llama-3.1-8B-Instruct'  # Any OpenAI model name
+    embedding_model_name = 'nvidia/NV-Embed-v2'  # Embedding model name (NV-Embed, GritLM or Contriever for now)
 
     # Startup a HippoRAG instance
     hipporag = HippoRAG(save_dir=save_dir,
                         llm_model_name=llm_model_name,
                         embedding_model_name=embedding_model_name,
-                        azure_endpoint=azure_endpoint,
-                        azure_embedding_endpoint=azure_embedding_endpoint
+                        llm_base_url="http://localhost:6578/v1"
                         )
 
     # Run indexing

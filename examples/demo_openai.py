@@ -1,8 +1,14 @@
 import os
+import sys
 from typing import List
 import json
 import argparse
 import logging
+
+# 兼容从仓库根目录执行：python examples/demo_openai.py
+_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
 
 from src.hipporag import HippoRAG
 
@@ -21,9 +27,9 @@ def main():
         "Montebello is a part of Rockland County."
     ]
 
-    save_dir = 'outputs'  # Define save directory for HippoRAG objects (each LLM/Embedding model combination will create a new subdirectory)
+    save_dir = 'outputs/openai'  # Define save directory for HippoRAG objects (each LLM/Embedding model combination will create a new subdirectory)
     llm_model_name = 'gpt-4o-mini'  # Any OpenAI model name
-    embedding_model_name = 'GritLM/GritLM-7B'  # Embedding model name (NV-Embed, GritLM or Contriever for now)
+    embedding_model_name = 'text-embedding-3-small'  # Embedding model name (NV-Embed, GritLM or Contriever for now)
 
     # Startup a HippoRAG instance
     hipporag = HippoRAG(save_dir=save_dir,

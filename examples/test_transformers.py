@@ -1,12 +1,23 @@
 import os
+import sys
 from typing import List
 import json
 import argparse
 import logging
 
+# 兼容从仓库根目录执行：python examples/test_transformers.py
+_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
+
 from src.hipporag import HippoRAG
+from src.hipporag.utils.config_utils import BaseConfig
+
+logging.basicConfig(level=logging.DEBUG)
 
 def main():
+
+
 
     # Prepare datasets and evaluation
     docs = [
@@ -21,15 +32,21 @@ def main():
         "Montebello is a part of Rockland County."
     ]
 
-    save_dir = 'outputs/demo_llama'  # Define save directory for HippoRAG objects (each LLM/Embedding model combination will create a new subdirectory)
-    llm_model_name = 'meta-llama/Llama-3.1-8B-Instruct'  # Any OpenAI model name
-    embedding_model_name = 'GritLM/GritLM-7B'  # Embedding model name (NV-Embed, GritLM or Contriever for now)
+    save_dir = 'outputs/local_test'  # Define save directory for HippoRAG objects (each LLM/Embedding model combination will create a new subdirectory)
+    llm_model_name = 'Transformers/Qwen/Qwen2.5-7B-Instruct'  # Any OpenAI model name
+    embedding_model_name = 'Transformers/BAAI/bge-m3'  # Embedding model name (NV-Embed, GritLM or Contriever for now)
+
+    global_config = BaseConfig(
+        openie_mode='Transformers-offline',
+        information_extraction_model_name='Transformers/Qwen/Qwen2.5-7B-Instruct'
+    )
 
     # Startup a HippoRAG instance
-    hipporag = HippoRAG(save_dir=save_dir,
+    hipporag = HippoRAG(global_config,
+                        save_dir=save_dir,
                         llm_model_name=llm_model_name,
                         embedding_model_name=embedding_model_name,
-                        llm_base_url="http://localhost:6578/v1")
+                        )
 
     # Run indexing
     hipporag.index(docs=docs)
@@ -59,7 +76,7 @@ def main():
 
     print(hipporag.rag_qa(queries=queries,
                                   gold_docs=gold_docs,
-                                  gold_answers=answers))
+                                  gold_answers=answers)[-2:])
 
 if __name__ == "__main__":
     main()

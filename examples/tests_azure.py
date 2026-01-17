@@ -1,12 +1,25 @@
 import os
+import sys
 from typing import List
 import json
 import argparse
 import logging
 
+# 兼容从仓库根目录执行：python examples/tests_azure.py
+_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
+
 from src.hipporag import HippoRAG
 
 def main():
+    parser = argparse.ArgumentParser(description="Testing HippoRAG")
+    parser.add_argument('--azure_endpoint', type=str, default=None, help='Azure Endpoint URL')
+    parser.add_argument('--azure_embedding_endpoint', type=str, default=None, help='Azure Embedding Endpoint')
+    args = parser.parse_args()
+
+    azure_endpoint = args.azure_endpoint
+    azure_embedding_endpoint = args.azure_embedding_endpoint
 
     # Prepare datasets and evaluation
     docs = [
@@ -21,14 +34,17 @@ def main():
         "Montebello is a part of Rockland County."
     ]
 
-    save_dir = 'outputs/openai_test'  # Define save directory for HippoRAG objects (each LLM/Embedding model combination will create a new subdirectory)
+    save_dir = 'outputs/azure_test'  # Define save directory for HippoRAG objects (each LLM/Embedding model combination will create a new subdirectory)
     llm_model_name = 'gpt-4o-mini'  # Any OpenAI model name
     embedding_model_name = 'text-embedding-3-small'  # Embedding model name (NV-Embed, GritLM or Contriever for now)
 
     # Startup a HippoRAG instance
     hipporag = HippoRAG(save_dir=save_dir,
                         llm_model_name=llm_model_name,
-                        embedding_model_name=embedding_model_name)
+                        embedding_model_name=embedding_model_name,
+                        azure_endpoint=azure_endpoint,
+                        azure_embedding_endpoint=azure_embedding_endpoint
+                        )
 
     # Run indexing
     hipporag.index(docs=docs)
@@ -63,7 +79,10 @@ def main():
     # Startup a HippoRAG instance
     hipporag = HippoRAG(save_dir=save_dir,
                         llm_model_name=llm_model_name,
-                        embedding_model_name=embedding_model_name)
+                        embedding_model_name=embedding_model_name,
+                        azure_endpoint="https://bernal-hipporag.openai.azure.com/openai/deployments/gpt-4o-mini/chat/completions?api-version=2025-01-01-preview",
+                        azure_embedding_endpoint="https://bernal-hipporag.openai.azure.com/openai/deployments/text-embedding-3-small/embeddings?api-version=2023-05-15"
+                        )
 
     print(hipporag.rag_qa(queries=queries,
                                   gold_docs=gold_docs,
@@ -72,7 +91,10 @@ def main():
     # Startup a HippoRAG instance
     hipporag = HippoRAG(save_dir=save_dir,
                         llm_model_name=llm_model_name,
-                        embedding_model_name=embedding_model_name)
+                        embedding_model_name=embedding_model_name,
+                        azure_endpoint="https://bernal-hipporag.openai.azure.com/openai/deployments/gpt-4o-mini/chat/completions?api-version=2025-01-01-preview",
+                        azure_embedding_endpoint="https://bernal-hipporag.openai.azure.com/openai/deployments/text-embedding-3-small/embeddings?api-version=2023-05-15"
+                        )
 
     new_docs = [
         "Tom Hort's birthplace is Montebello.",

@@ -1,4 +1,3 @@
-hipporag2/*
 .idea/*
 
 # Ignore test files
@@ -21,9 +20,4 @@ data/
 clear_outputs_and_logs.sh
 # Ignore the env file
 .env
-
-# Ignore project-specific files
-CLAUDE.md
-workspace/
-verification_and_analysis/
-.claude/
+KEY.txt
