@@ -1,6 +1,6 @@
-# CLAUDE.md
+# AGENTS.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+本文件为 Codex CLI（OpenAI Codex）在本仓库进行开发与实验时提供提示与约定。
 
 ## 项目概述
 
