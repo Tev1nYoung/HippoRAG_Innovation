@@ -74,6 +74,9 @@ def main():
     parser.add_argument('--llm_base_url', type=str, default='https://api.openai.com/v1', help='LLM base URL')
     parser.add_argument('--llm_name', type=str, default='gpt-4o-mini', help='LLM name')
     parser.add_argument('--embedding_name', type=str, default='nvidia/NV-Embed-v2', help='embedding model name')
+    parser.add_argument('--only_retrieval', action='store_true', help='只跑检索与 Recall 评估（不跑 QA，节省 API 成本）')
+    parser.add_argument('--query_start', type=int, default=0, help='从第几个问题开始跑（默认 0）')
+    parser.add_argument('--max_queries', type=int, default=0, help='最多跑多少个问题（0 表示全量）')
     parser.add_argument('--force_index_from_scratch', type=str, default='false',
                         help='If set to True, will ignore all existing storage files and graph data and will rebuild from scratch.')
     parser.add_argument('--force_openie_from_scratch', type=str, default='false', help='If set to False, will try to first reuse openie results for the corpus if they exist.')
@@ -101,13 +104,20 @@ def main():
     force_openie_from_scratch = string_to_bool(args.force_openie_from_scratch)
 
     # Prepare datasets and evaluation
-    samples = json.load(open(f"reproduce/dataset/{dataset_name}.json", "r"))
+    all_samples = json.load(open(f"reproduce/dataset/{dataset_name}.json", "r"))
+    query_start = max(int(args.query_start or 0), 0)
+    if args.max_queries and int(args.max_queries) > 0:
+        query_end = query_start + int(args.max_queries)
+        samples = all_samples[query_start:query_end]
+    else:
+        samples = all_samples[query_start:]
     all_queries = [s['question'] for s in samples]
 
-    gold_answers = get_gold_answers(samples)
+    gold_answers = [] if args.only_retrieval else get_gold_answers(samples)
     try:
         gold_docs = get_gold_docs(samples, dataset_name)
-        assert len(all_queries) == len(gold_docs) == len(gold_answers), "Length of queries, gold_docs, and gold_answers should be the same."
+        if not args.only_retrieval:
+            assert len(all_queries) == len(gold_docs) == len(gold_answers), "Length of queries, gold_docs, and gold_answers should be the same."
     except:
         gold_docs = None
 
@@ -139,7 +149,10 @@ def main():
     hipporag.index(docs)
 
     # Retrieval and QA
-    hipporag.rag_qa(queries=all_queries, gold_docs=gold_docs, gold_answers=gold_answers)
+    if args.only_retrieval:
+        hipporag.retrieve(queries=all_queries, gold_docs=gold_docs)
+    else:
+        hipporag.rag_qa(queries=all_queries, gold_docs=gold_docs, gold_answers=gold_answers)
 
 if __name__ == "__main__":
     main()

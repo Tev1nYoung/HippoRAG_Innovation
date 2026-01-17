@@ -1,6 +1,7 @@
 import json
 import os
 import logging
+import sqlite3
 from dataclasses import dataclass, field, asdict
 from datetime import datetime
 from typing import Union, Optional, List, Set, Dict, Any, Tuple, Literal
@@ -1737,6 +1738,98 @@ class HippoRAG:
 
         self.ready_to_retrieve = True
 
+    def _query_embedding_cache_enabled(self) -> bool:
+        """
+        是否启用 query embedding 的落盘缓存（只缓存 query_to_fact / query_to_passage）。
+        - BaseConfig 未显式提供该字段时默认启用（True）
+        """
+        return bool(getattr(self.global_config, "cache_query_embeddings", True))
+
+    def _query_embedding_cache_path(self) -> str:
+        """
+        query embedding cache 路径（SQLite）：
+        outputs/<dataset>/llm_cache/<working_dir_name>/query_embedding_cache.sqlite
+        """
+        cache_dir = os.path.join(self.global_config.save_dir, "llm_cache", os.path.basename(self.working_dir))
+        os.makedirs(cache_dir, exist_ok=True)
+        return os.path.join(cache_dir, "query_embedding_cache.sqlite")
+
+    def _init_query_embedding_cache(self, conn: sqlite3.Connection) -> None:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS query_embeddings (
+                query TEXT NOT NULL,
+                embed_type TEXT NOT NULL,
+                embedding BLOB NOT NULL,
+                dim INTEGER NOT NULL,
+                dtype TEXT NOT NULL,
+                created_at TEXT,
+                PRIMARY KEY (query, embed_type)
+            )
+            """
+        )
+
+    def _query_embedding_cache_get_many(self, queries: List[str], embed_type: str) -> Dict[str, np.ndarray]:
+        if not self._query_embedding_cache_enabled():
+            return {}
+        queries = [q for q in queries if isinstance(q, str) and q]
+        if not queries:
+            return {}
+
+        cache_path = self._query_embedding_cache_path()
+        if not os.path.exists(cache_path):
+            return {}
+
+        out: Dict[str, np.ndarray] = {}
+        try:
+            conn = sqlite3.connect(cache_path, timeout=30)
+            self._init_query_embedding_cache(conn)
+            placeholders = ",".join(["?"] * len(queries))
+            rows = conn.execute(
+                f"SELECT query, embedding, dim, dtype FROM query_embeddings WHERE embed_type = ? AND query IN ({placeholders})",
+                [embed_type, *queries],
+            ).fetchall()
+            conn.close()
+
+            for q, blob, dim, dtype in rows:
+                try:
+                    arr = np.frombuffer(blob, dtype=np.dtype(dtype))
+                    arr = arr.reshape((int(dim),)).astype(np.float32, copy=False)
+                    out[str(q)] = arr
+                except Exception:
+                    continue
+            return out
+        except Exception:
+            return {}
+
+    def _query_embedding_cache_set_many(self, query_to_emb: Dict[str, np.ndarray], embed_type: str) -> None:
+        if not self._query_embedding_cache_enabled():
+            return
+        if not query_to_emb:
+            return
+
+        cache_path = self._query_embedding_cache_path()
+        try:
+            conn = sqlite3.connect(cache_path, timeout=30)
+            self._init_query_embedding_cache(conn)
+            now = datetime.now().isoformat(timespec="seconds")
+            rows = []
+            for q, emb in query_to_emb.items():
+                if not isinstance(q, str) or not q:
+                    continue
+                arr = np.asarray(emb, dtype=np.float32)
+                arr = np.squeeze(arr).reshape(-1)
+                rows.append((q, embed_type, sqlite3.Binary(arr.tobytes()), int(arr.shape[0]), str(arr.dtype), now))
+            if rows:
+                conn.executemany(
+                    "INSERT OR REPLACE INTO query_embeddings(query, embed_type, embedding, dim, dtype, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                    rows,
+                )
+                conn.commit()
+            conn.close()
+        except Exception:
+            return
+
     def get_query_embeddings(self, queries: List[str] | List[QuerySolution]):
         """
         Retrieves embeddings for given queries and updates the internal query-to-embedding mapping. The method determines whether each query
@@ -1748,30 +1841,71 @@ class HippoRAG:
             its presence in the query-to-embedding mappings.
         """
 
-        all_query_strings = []
+        if self.embedding_model is None:
+            return
+
+        all_query_strings: List[str] = []
         for query in queries:
-            if isinstance(query, QuerySolution) and (
-                    query.question not in self.query_to_embedding['triple'] or query.question not in
-                    self.query_to_embedding['passage']):
-                all_query_strings.append(query.question)
-            elif query not in self.query_to_embedding['triple'] or query not in self.query_to_embedding['passage']:
-                all_query_strings.append(query)
+            if isinstance(query, QuerySolution):
+                q = query.question
+            else:
+                q = query
+            if not isinstance(q, str) or not q:
+                continue
+            if q not in self.query_to_embedding['triple'] or q not in self.query_to_embedding['passage']:
+                all_query_strings.append(q)
 
-        if len(all_query_strings) > 0:
-            # get all query embeddings
-            logger.info(f"为 {len(all_query_strings)} 个查询编码 query_to_fact")
-            query_embeddings_for_triple = self.embedding_model.batch_encode(all_query_strings,
-                                                                            instruction=get_query_instruction('query_to_fact'),
-                                                                            norm=True)
-            for query, embedding in zip(all_query_strings, query_embeddings_for_triple):
-                self.query_to_embedding['triple'][query] = embedding
+        if not all_query_strings:
+            return
 
-            logger.info(f"为 {len(all_query_strings)} 个查询编码 query_to_passage")
-            query_embeddings_for_passage = self.embedding_model.batch_encode(all_query_strings,
-                                                                             instruction=get_query_instruction('query_to_passage'),
-                                                                             norm=True)
-            for query, embedding in zip(all_query_strings, query_embeddings_for_passage):
-                self.query_to_embedding['passage'][query] = embedding
+        # 1) 先尝试从磁盘缓存读取（跨运行复用）
+        cached_triple = self._query_embedding_cache_get_many(all_query_strings, "triple")
+        for q, emb in cached_triple.items():
+            self.query_to_embedding['triple'][q] = emb
+        cached_passage = self._query_embedding_cache_get_many(all_query_strings, "passage")
+        for q, emb in cached_passage.items():
+            self.query_to_embedding['passage'][q] = emb
+
+        missing_triple = [q for q in all_query_strings if q not in self.query_to_embedding['triple']]
+        missing_passage = [q for q in all_query_strings if q not in self.query_to_embedding['passage']]
+
+        chunk_size = int(getattr(self.global_config, "query_embedding_chunk_size", 32) or 32)
+        chunk_size = max(1, chunk_size)
+
+        # 2) 对仍缺失的部分再调用 embedding 模型编码，并写回磁盘缓存（分块写入，便于中断后续跑复用）
+        if len(missing_triple) > 0:
+            logger.info(f"为 {len(missing_triple)} 个查询编码 query_to_fact")
+            for i in range(0, len(missing_triple), chunk_size):
+                batch = missing_triple[i:i + chunk_size]
+                embs = self.embedding_model.batch_encode(
+                    batch,
+                    instruction=get_query_instruction('query_to_fact'),
+                    norm=True
+                )
+                new_rows: Dict[str, np.ndarray] = {}
+                for q, emb in zip(batch, embs):
+                    arr = np.asarray(emb, dtype=np.float32)
+                    arr = np.squeeze(arr).reshape(-1)
+                    self.query_to_embedding['triple'][q] = arr
+                    new_rows[q] = arr
+                self._query_embedding_cache_set_many(new_rows, "triple")
+
+        if len(missing_passage) > 0:
+            logger.info(f"为 {len(missing_passage)} 个查询编码 query_to_passage")
+            for i in range(0, len(missing_passage), chunk_size):
+                batch = missing_passage[i:i + chunk_size]
+                embs = self.embedding_model.batch_encode(
+                    batch,
+                    instruction=get_query_instruction('query_to_passage'),
+                    norm=True
+                )
+                new_rows: Dict[str, np.ndarray] = {}
+                for q, emb in zip(batch, embs):
+                    arr = np.asarray(emb, dtype=np.float32)
+                    arr = np.squeeze(arr).reshape(-1)
+                    self.query_to_embedding['passage'][q] = arr
+                    new_rows[q] = arr
+                self._query_embedding_cache_set_many(new_rows, "passage")
 
     def get_fact_scores(self, query: str) -> np.ndarray:
         """
@@ -1795,9 +1929,19 @@ class HippoRAG:
         """
         query_embedding = self.query_to_embedding['triple'].get(query, None)
         if query_embedding is None:
-            query_embedding = self.embedding_model.batch_encode(query,
-                                                                instruction=get_query_instruction('query_to_fact'),
-                                                                norm=True)
+            cached = self._query_embedding_cache_get_many([query], "triple").get(query, None)
+            if cached is not None:
+                query_embedding = cached
+                self.query_to_embedding['triple'][query] = cached
+            else:
+                query_embedding = self.embedding_model.batch_encode(
+                    [query],
+                    instruction=get_query_instruction('query_to_fact'),
+                    norm=True
+                )[0]
+                query_embedding = np.asarray(query_embedding, dtype=np.float32).reshape(-1)
+                self.query_to_embedding['triple'][query] = query_embedding
+                self._query_embedding_cache_set_many({query: query_embedding}, "triple")
 
         # Check if there are any facts
         if len(self.fact_embeddings) == 0:
@@ -1839,9 +1983,19 @@ class HippoRAG:
         """
         query_embedding = self.query_to_embedding['passage'].get(query, None)
         if query_embedding is None:
-            query_embedding = self.embedding_model.batch_encode(query,
-                                                                instruction=get_query_instruction('query_to_passage'),
-                                                                norm=True)
+            cached = self._query_embedding_cache_get_many([query], "passage").get(query, None)
+            if cached is not None:
+                query_embedding = cached
+                self.query_to_embedding['passage'][query] = cached
+            else:
+                query_embedding = self.embedding_model.batch_encode(
+                    [query],
+                    instruction=get_query_instruction('query_to_passage'),
+                    norm=True
+                )[0]
+                query_embedding = np.asarray(query_embedding, dtype=np.float32).reshape(-1)
+                self.query_to_embedding['passage'][query] = query_embedding
+                self._query_embedding_cache_set_many({query: query_embedding}, "passage")
         query_doc_scores = np.dot(self.passage_embeddings, query_embedding.T)
         query_doc_scores = np.squeeze(query_doc_scores) if query_doc_scores.ndim == 2 else query_doc_scores
         query_doc_scores = min_max_normalize(query_doc_scores)
